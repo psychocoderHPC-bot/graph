@@ -1,20 +1,23 @@
 # SPDX-FileCopyrightText: 2026 René Widera and contributors
 # SPDX-License-Identifier: MPL-2.0
 
-# Register one Catch2 executable per unit test source file. CONFIGURE_DEPENDS
-# re-globs when a later milestone adds a file, so tests never need a CMake edit.
-# Every unit test is registered through this single glob; main and the atomic
-# branch each added a separate registration, merged here without duplication.
-file(GLOB GRAPH_UNIT_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cpp")
+# Drop-in test registration: every `tests/unit/test_*.cpp` and
+# `tests/integration/test_*.cpp` becomes its own Catch2 executable and CTest
+# entry, so adding a test file needs no CMake edit. CONFIGURE_DEPENDS re-runs
+# the glob at build time. The example tree is on the include path because the
+# CLI header is header-only and has no target of its own yet.
+file(
+    GLOB GRAPH_TEST_SOURCES
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/unit/test_*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/integration/test_*.cpp"
+)
 
-foreach(_graph_unit_source IN LISTS GRAPH_UNIT_TEST_SOURCES)
-    get_filename_component(_graph_unit_stem "${_graph_unit_source}" NAME_WE)
-    string(REGEX REPLACE "^test_" "" _graph_unit_name "${_graph_unit_stem}")
-    set(_graph_unit_target "graph_${_graph_unit_name}")
-
-    add_executable(${_graph_unit_target} "${_graph_unit_source}")
-    target_link_libraries(${_graph_unit_target} PRIVATE graph::graph Catch2::Catch2WithMain)
-    graph_finalize(${_graph_unit_target})
-
-    catch_discover_tests(${_graph_unit_target} PROPERTIES TIMEOUT 300)
+foreach(graph_test_source IN LISTS GRAPH_TEST_SOURCES)
+    get_filename_component(graph_test_name "${graph_test_source}" NAME_WE)
+    add_executable(${graph_test_name} "${graph_test_source}")
+    target_link_libraries(${graph_test_name} PRIVATE graph::graph Catch2::Catch2WithMain)
+    target_include_directories(${graph_test_name} PRIVATE "${PROJECT_SOURCE_DIR}/examples")
+    graph_finalize(${graph_test_name})
+    catch_discover_tests(${graph_test_name} PROPERTIES TIMEOUT 300)
 endforeach()
