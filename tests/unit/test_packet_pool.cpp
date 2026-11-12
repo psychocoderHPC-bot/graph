@@ -256,18 +256,29 @@ namespace
             auto const gridBlocks = static_cast<std::uint32_t>(
                 acc.getExtentsOf(alpaka::onAcc::origin::grid, alpaka::onAcc::unit::blocks)[0]);
 
-            // Block 0 configures. The serial CPU executor runs blocks
-            // sequentially and CUDA runs them concurrently, so a device-scope
-            // fence orders the configure stores against the first acquire
-            // without a grid barrier (which this alpaka version does not
-            // provide).
-            if(blockIndex == 0u)
+            // Block 0 configures the pool and sets a device-wide ready flag.
+            // All other blocks spin on the flag before acquiring: without a
+            // grid barrier (which this alpaka version does not provide), a
+            // device-scope fence alone does not order the configure stores
+            // against the first acquire in other blocks. The ready flag is
+            // stored in the results array (results[10]).
+            auto* readyFlag = reinterpret_cast<std::uint64_t*>(results + 10);
+            if(blockIndex == 0u && warp.isLeader())
             {
                 auto budget = graph::PacketPoolBudget{};
                 budget.liveParticles = static_cast<std::uint32_t>(T_SlotCapacity);
                 (void) pool.configure(acc, warp, budget);
+                alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
+                *readyFlag = 1ull;
             }
-            alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
+            // All warps wait for the ready flag (device-scope acquire).
+            {
+                auto volatile* vflag = reinterpret_cast<std::uint64_t volatile*>(readyFlag);
+                while(*vflag == 0ull)
+                {
+                    alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::acquire);
+                }
+            }
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::acquire);
 
             std::uint64_t acqOk = 0u, acqFail = 0u, relFail = 0u, doubleOut = 0u, nonMono = 0u;
@@ -458,7 +469,7 @@ namespace
     {
         auto device = makeTestDevice();
         using Pool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
-        auto const totalBytes = Pool::storageBytes + 10 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
+        auto const totalBytes = Pool::storageBytes + 11 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
 
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
