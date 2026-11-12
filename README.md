@@ -48,3 +48,42 @@ Not available yet. The scaffolding commit contains no CMake project.
 
 MPL-2.0. See `LICENSE` and `LICENSES/MPL-2.0.txt`. Files copied from alpaka
 retain their upstream copyright notices.
+
+## Build and run the bootstrap tests
+
+The M0 bootstrap configures, builds, and runs a Catch2 smoke test for both a CPU
+and an NVIDIA CUDA configuration. The smoke test selects the backend from the
+`GRAPH_HAS_CUDA` feature macro and runs one fill kernel, so it exercises the
+device selection, queue, kernel launch, and copy path.
+
+alpaka is fetched at the pinned revision
+`4780dc786a2eb1a5452a1c66d94a8b442d411ab8`. Pass
+`-DGRAPH_ALPAKA_SOURCE_DIR=/path/to/alpaka` to use an existing checkout instead
+(useful for offline builds). Catch2 is pinned to `v3.15.0`, the revision the
+pinned alpaka test tree uses.
+
+### CPU
+
+```bash
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DGRAPH_ENABLE_CUDA=OFF
+cmake --build build-cpu -j 16
+ctest --test-dir build-cpu --output-on-failure --timeout 120
+```
+
+The CPU configuration does not require a CUDA toolkit. `GRAPH_ENABLE_OPENMP`
+defaults to `ON` when OpenMP is found and to `OFF` otherwise.
+
+### NVIDIA CUDA
+
+```bash
+cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DGRAPH_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build-cuda -j 16
+ctest --test-dir build-cuda --output-on-failure --timeout 120
+```
+
+`GRAPH_ENABLE_CUDA=ON` enables the CUDA language and relocatable device code
+(`alpaka_RELOCATABLE_DEVICE_CODE=ON`). When `CMAKE_CUDA_ARCHITECTURES` is not
+set, the configure step reads the compute capability of the first visible GPU
+through `nvidia-smi` and falls back to `80` (NVIDIA A30/A100); the default used
+by the bootstrap validation on `hal` is `80` for the A30.
