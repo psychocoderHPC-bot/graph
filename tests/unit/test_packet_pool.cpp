@@ -276,6 +276,10 @@ namespace
                 // The CPU serial executor runs one width-one warp per launch, so
                 // it does one warp's share; the GPU runs every block's warp and
                 // the expected total scales with the block count.
+                // A monotonically increasing nonce distinguishes the current
+                // holder from the previous one: a marker with a different
+                // nonce means a double hand-out.
+                std::uint64_t nonce = 0u;
                 for(std::uint32_t i = 0u; i < acquiresPerWarp; ++i)
                 {
                     graph::PacketHandle h{};
@@ -289,12 +293,12 @@ namespace
                         continue;
                     }
                     acqOk++;
-                    auto const gen = h.generation;
-                    // Device-atomic exchange on the per-slot marker: this warp
-                    // now owns the slot, so the marker must be zero (the
-                    // previous holder cleared it atomically before releasing).
-                    // A nonzero return means a double hand-out.
-                    auto const marker = static_cast<std::uint64_t>(blockIndex + 1u) << 32u | gen;
+                    nonce++;
+                    // Device-atomic exchange on the per-slot marker. The
+                    // previous holder cleared the marker atomically before
+                    // releasing the slot, so a nonzero return with a
+                    // different nonce means a double hand-out.
+                    auto const marker = static_cast<std::uint64_t>(blockIndex + 1u) << 32u | nonce;
                     auto const prev = alpaka::onAcc::atomicExch(
                         acc,
                         &out[h.index],
@@ -303,19 +307,20 @@ namespace
                     if(prev != 0ull)
                     {
                         doubleOut++;
-                        if(gen < (prev & 0xffff'ffffull))
+                        // Non-monotonic: the previous holder's nonce is
+                        // greater than ours (should not happen).
+                        if((prev & 0xffff'ffffull) > nonce)
                             nonMono++;
                     }
+                    // Clear the marker atomically BEFORE the release: once
+                    // the slot is back on the free list, another warp may pop
+                    // it and exchange its own marker. The clear is safe: this
+                    // warp still owns the slot (release has not run yet), so
+                    // no other warp can be writing to `out[h.index]`.
+                    alpaka::onAcc::atomicExch(acc, &out[h.index], std::uint64_t{0u}, alpaka::onAcc::scope::device);
                     bool const freed = pool.release(acc, warp, h);
                     if(!freed)
                         relFail++;
-                    // Clear the marker atomically BEFORE the slot is visible
-                    // again: the next acquirer pops the slot from the free list
-                    // and exchanges its own marker, so a stale nonzero value
-                    // would be a false double hand-out. The slot is still
-                    // exclusive to this warp (release has not run yet), so the
-                    // clear cannot race with another holder.
-                    alpaka::onAcc::atomicExch(acc, &out[h.index], std::uint64_t{0u}, alpaka::onAcc::scope::device);
                 }
             }
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);

@@ -544,64 +544,71 @@ namespace graph
          * The winner advances the head, increments the slot's generation and
          * sets `active`, and publishes the record with a device-scope release
          * before the head CAS. Returns false when the pool is empty.
+         *
+         * The CAS is retried up to `T_MaxPopAttempts` times: under multi-warp
+         * contention a CAS failure means another warp advanced the head first,
+         * so the next iteration reads the new head and retries. The meta and
+         * record stores are performed only after a successful CAS to avoid
+         * corrupting the slot's free-list pointer (which encodes the
+         * successor) before the pop is committed.
          */
         ALPAKA_FN_ACC constexpr bool popSlot(Acc const& acc, PacketHandle& out) const noexcept
         {
+            static constexpr std::uint32_t T_MaxPopAttempts = 1u << 20u;
             auto* hdr = &header();
-            // Read the head with a raw volatile load: the value is only a
-            // candidate for the CAS that follows, and a stale read is safe
-            // because the CAS re-validates it atomically.
-            std::uint32_t const expected = *reinterpret_cast<std::uint32_t volatile*>(&hdr->freeListHead);
-            if(headIsTerminator(expected))
-                return false;
-            std::uint32_t const index = headIndex(expected);
-            if(index >= static_cast<std::uint32_t>(T_SlotCapacity))
-                return false;
-            auto* slot = &slotAt(index);
-            // Acquire: order the slot reads below against the release that
-            // preceded the head advance that made this slot visible.
-            pool_detail::claimAcquire(acc);
-            // Diagnostic: count meta checks. A slot at the head must be free
-            // (active == 0, generation matching the handle). If it is not,
-            // the free list is corrupted.
-            (void) pool_detail::atomicAddDevice(acc, &hdr->metaChecks, std::uint64_t{1u});
-            // The successor is encoded in the slot's free-list field; it is
-            // stable while this slot is at the head (only a push of this
-            // slot can change it, and a push requires a release, which
-            // requires the slot to be held, which requires it off the list).
-            std::uint32_t const next = slot->record.handle.index;
-            // Bump the generation and mark the slot active. The meta stores
-            // are performed before the CAS: if the CAS fails, another warp
-            // moved the head and this attempt is discarded, but the meta
-            // stores are harmless (the slot is still at the head or has been
-            // released, and the next popper/release re-validates).
-            slot->meta.generation += 1u;
-            slot->meta.active = 1u;
-            slot->record.handle.index = index;
-            slot->record.handle.generation = slot->meta.generation;
-            slot->record.elementCount = 0u;
-            slot->record.schema = ElementSchema{};
-            // Release the record before publishing the head advance.
-            pool_detail::publishRelease(acc);
-            // Build the desired head: the successor's index with the
-            // terminator tag. The tag is what closes the ABA window: a
-            // stale CAS against a head that has cycled through the same
-            // index fails because the tag differs.
-            std::uint32_t const desiredTag = (next == invalidSlotIndex) ? 1u : 0u;
-            std::uint32_t const desired = encodeHead(next, desiredTag);
-            std::uint32_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
-            if(result == expected)
+            for(std::uint32_t attempt = 0u; attempt < T_MaxPopAttempts; ++attempt)
             {
-                (void) pool_detail::atomicAddDevice(acc, &hdr->headVersion, std::uint32_t{1u});
-                // Decrement: freeCount is a uint64_t; the value -1 wraps to
-                // 0xFFFF...FFFF which is the correct 2's-complement decrement.
-                (void) pool_detail::atomicAddDevice(acc, &hdr->freeCount, ~std::uint64_t{0u});
-                out.index = index;
-                out.generation = slot->meta.generation;
-                return true;
+                // Read the head with a raw volatile load: the value is only a
+                // candidate for the CAS that follows, and a stale read is safe
+                // because the CAS re-validates it atomically.
+                std::uint32_t const expected = *reinterpret_cast<std::uint32_t volatile*>(&hdr->freeListHead);
+                if(headIsTerminator(expected))
+                    return false;
+                std::uint32_t const index = headIndex(expected);
+                if(index >= static_cast<std::uint32_t>(T_SlotCapacity))
+                    return false;
+                auto* slot = &slotAt(index);
+                // Acquire: order the slot reads below against the release that
+                // preceded the head advance that made this slot visible.
+                pool_detail::claimAcquire(acc);
+                // The successor is encoded in the slot's free-list field; it is
+                // stable while this slot is at the head (only a push of this
+                // slot can change it, and a push requires a release, which
+                // requires the slot to be held, which requires it off the list).
+                std::uint32_t const next = slot->record.handle.index;
+                // Build the desired head: the successor's index with the
+                // terminator tag. The tag is what closes the ABA window: a
+                // stale CAS against a head that has cycled through the same
+                // index fails because the tag differs.
+                std::uint32_t const desiredTag = (next == invalidSlotIndex) ? 1u : 0u;
+                std::uint32_t const desired = encodeHead(next, desiredTag);
+                std::uint32_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
+                if(result == expected)
+                {
+                    // CAS succeeded: commit the slot's meta and record.
+                    // The meta stores are safe now: this warp owns the slot
+                    // (it just advanced the head), and no other warp can pop
+                    // this slot until it is released back to the free list.
+                    slot->meta.generation += 1u;
+                    slot->meta.active = 1u;
+                    slot->record.handle.index = index;
+                    slot->record.handle.generation = slot->meta.generation;
+                    slot->record.elementCount = 0u;
+                    slot->record.schema = ElementSchema{};
+                    // Release the record before the caller reads it.
+                    pool_detail::publishRelease(acc);
+                    (void) pool_detail::atomicAddDevice(acc, &hdr->headVersion, std::uint32_t{1u});
+                    // Decrement: freeCount is a uint64_t; the value -1 wraps to
+                    // 0xFFFF...FFFF which is the correct 2's-complement decrement.
+                    (void) pool_detail::atomicAddDevice(acc, &hdr->freeCount, ~std::uint64_t{0u});
+                    out.index = index;
+                    out.generation = slot->meta.generation;
+                    return true;
+                }
+                // CAS failed: another warp moved the head. Retry with the new
+                // head. Count the failure for diagnostics.
+                (void) pool_detail::atomicAddDevice(acc, &hdr->casFailures, std::uint64_t{1u});
             }
-            // CAS failed: another warp moved the head.
-            (void) pool_detail::atomicAddDevice(acc, &hdr->casFailures, std::uint64_t{1u});
             return false;
         }
 
