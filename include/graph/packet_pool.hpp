@@ -539,6 +539,12 @@ namespace graph
             return (head & headTag) != 0u;
         }
 
+        /** Maximum number of CAS retries in popSlot. A failed CAS means
+         *  another warp advanced the head; the next iteration reads the new
+         *  head and retries. 2^20 is more than enough for realistic
+         *  contention (16-1024 warps on a 64-slot pool). */
+        static constexpr std::uint32_t maxPopAttempts = 1u << 20u;
+
         /** Pop one slot from the free list via a CAS on the tagged head.
          *
          * The winner advances the head, increments the slot's generation and
@@ -554,9 +560,8 @@ namespace graph
          */
         ALPAKA_FN_ACC constexpr bool popSlot(Acc const& acc, PacketHandle& out) const noexcept
         {
-            static constexpr std::uint32_t T_MaxPopAttempts = 1u << 20u;
             auto* hdr = &header();
-            for(std::uint32_t attempt = 0u; attempt < T_MaxPopAttempts; ++attempt)
+            for(std::uint32_t attempt = 0u; attempt < maxPopAttempts; ++attempt)
             {
                 // Read the head with a raw volatile load: the value is only a
                 // candidate for the CAS that follows, and a stale read is safe
