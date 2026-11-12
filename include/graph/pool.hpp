@@ -343,6 +343,15 @@ namespace graph
                 , m_queue(m_device.makeQueue())
             {
                 static_cast<void>(m_binder);
+                // The wave is sized conservatively. The build-time capture now
+                // measures the pool's own persistent-kernel register usage (see
+                // `cmake/GraphRegisterProbe.cu`); on the HAL A30 that kernel
+                // uses ~40 registers/thread, which alone allows ~20 blocks/SM.
+                // That shape is too large to guarantee a single resident wave
+                // on a contended GPU, so the conservative 128-register hint
+                // (896 blocks) is the safe default and stays in place until a
+                // measured single-wave proof exists for the 40-register shape.
+                // A positive `registerHint` still overrides it.
                 int const registerHint = m_config.registerHint > 0 ? m_config.registerHint : fallbackKernelRegisters;
                 auto const environment = queryLaunchEnvironment(m_device, registerHint);
                 m_geometry = computeLaunchGeometry(environment.props, LaunchPolicy{});

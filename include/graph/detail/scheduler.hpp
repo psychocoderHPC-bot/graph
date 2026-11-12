@@ -246,6 +246,41 @@ namespace graph
             return false;
         }
 
+        /** True when the handle broadcast with a ready entry still names a
+         *  slot the pool considers owned: the slot is active and its
+         *  generation matches the handle's.
+         *
+         * The handle is the contract of the ready entry (its index and
+         * generation were broadcast with the descriptor). A mismatch means the
+         * slot was recycled or the descriptor is stale, which is a protocol
+         * violation: it is recorded as an ownership violation and the job is
+         * dropped rather than executed against a packet it does not own. The
+         * check runs on every lane (warp-uniform), so the failure is
+         * deterministic for the warp instead of a lane-by-lane data race.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline bool packetHandleValid(SchedulerRuntime<T_Acc>& runtime, PacketHandle const& handle)
+            noexcept
+        {
+            if(handle.index >= static_cast<std::uint32_t>(poolPacketSlotCapacity))
+            {
+                if(runtime.warp.isLeader())
+                    recordError(runtime, PoolError::internalState);
+                return false;
+            }
+            PacketRecord const& record = runtime.pool.slotRecord(handle);
+            // Ownership is carried by the generation: the slot is owned by this
+            // handle iff the pool's current generation for that index equals the
+            // generation broadcast with the descriptor. `elementCount` is not an
+            // ownership signal: under a deliberately small pool a valid in-flight
+            // job can be claimed while its payload is not yet fully configured,
+            // so a zero elementCount must not drop the job.
+            bool const matches = record.handle.generation == handle.generation;
+            if(!matches && runtime.warp.isLeader())
+                (void) addDevice(runtime.acc, &runtime.state.readyViolations, std::uint64_t{1u});
+            return matches;
+        }
+
         /** Publish one ready entry, retrying a transient lock contention.
          *
          * The ring lock is held only for a short critical section and is never
@@ -591,11 +626,13 @@ namespace graph
                 return false;
             }
 
-            // The packet pool's slot record is the authority for the packet
-            // identity. The ready-ring copy of the handle is only a scheduling
-            // token; taking the generation from the record keeps ownership
-            // checks exact even when a descriptor crossed a warp broadcast.
-            PacketHandle const ownedPacket = runtime.pool.slotRecord(job.packet).handle;
+            // The handle broadcast with the ready entry (scalar index and
+            // generation, then the whole descriptor through the leader) names
+            // the packet that was acquired for this job. It is the authority
+            // for the successor: re-deriving it from the pool slot would alias
+            // whichever packet the slot currently holds and hide a stale or
+            // lost descriptor.
+            PacketHandle const ownedPacket = job.packet;
 
             bool ok = true;
             // Resumable source range: emit at most one chunk per invocation and
@@ -622,7 +659,10 @@ namespace graph
                             (void) addDevice(runtime.acc, &runtime.state.publications, std::uint64_t{1u});
                         }
                         JobDescriptor next = job;
-                        next.packet = runtime.pool.slotRecord(continuation).handle;
+                        // The acquire above broadcast the fresh handle to every
+                        // lane, so the continuation descriptor carries the exact
+                        // index/generation the pool just handed out.
+                        next.packet = continuation;
                         next.request.firstId = job.request.firstId + emitted;
                         next.request.count = job.request.count - emitted;
                         RingStatus const status = enqueueWithRetry(runtime, next);
@@ -690,6 +730,11 @@ namespace graph
         {
             CompiledNode const* node = findNode(runtime.graph, job.operation);
             bool const isSource = node != nullptr && node->isSource;
+            // A non-source job names the packet it reads. Reject a handle whose
+            // generation no longer matches the slot: executing it would read a
+            // packet the job does not own.
+            if(!isSource && !packetHandleValid(runtime, job.packet))
+                return false;
             PacketAccessor accessor{};
             if(job.packet.index < static_cast<std::uint32_t>(poolPacketSlotCapacity))
             {
