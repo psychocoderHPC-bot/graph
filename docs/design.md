@@ -29,6 +29,21 @@ alpaka3, pinned at
   two bins with a feedback cycle, destroys particles, and prints the exact
   final-weight histogram.
 
+## Where the detail lives
+
+This file is the index. The module map, the data path with its ordering rules,
+and the launch geometry are in [`architecture.md`](architecture.md). The exact
+RNG construction, the particle semantics, and the determinism statement are in
+[`numerics.md`](numerics.md). The current engineering gaps are in
+[`known-limitations.md`](known-limitations.md). Build and test commands are in
+[`build.md`](build.md); the CI pipeline in [`ci.md`](ci.md); the HAL hardware
+record in [`hal-acceptance.md`](hal-acceptance.md).
+
+The pinned alpaka revision is
+`4780dc786a2eb1a5452a1c66d94a8b442d411ab8` on `dev_v3.x`; it is the reference
+for architecture, code style, and formatting. The module map is the table in
+[`architecture.md`](architecture.md).
+
 References: [alpaka README](https://github.com/alpaka-group/alpaka/blob/4780dc786a2eb1a5452a1c66d94a8b442d411ab8/README.md),
 [warp tutorial](https://github.com/alpaka-group/alpaka/blob/4780dc786a2eb1a5452a1c66d94a8b442d411ab8/docs/source/tutorial/warp.rst),
 [atomic.hpp](https://github.com/alpaka-group/alpaka/blob/4780dc786a2eb1a5452a1c66d94a8b442d411ab8/include/alpaka/onAcc/atomic.hpp),
