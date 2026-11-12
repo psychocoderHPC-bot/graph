@@ -245,8 +245,9 @@ namespace
 
             auto* base = static_cast<std::uint8_t*>(storage.data());
             Pool pool{base};
+            // Layout: [pool storage][results: 12 uint64_t][out: T_SlotCapacity uint64_t]
             auto* results = reinterpret_cast<std::uint64_t*>(base + Pool::storageBytes);
-            auto* out = reinterpret_cast<std::uint64_t*>(base + Pool::storageBytes + 8 * sizeof(std::uint64_t));
+            auto* out = reinterpret_cast<std::uint64_t*>(base + Pool::storageBytes + 12 * sizeof(std::uint64_t));
             graph::WarpGroup<Acc> warp{acc};
             graph::WarpBarrier<Acc> barrier{};
             constexpr std::uint32_t blockThreads = 32u;
