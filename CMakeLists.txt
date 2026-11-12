@@ -23,6 +23,17 @@ endif()
 include(GraphDependencies)
 include(GraphTargets)
 
+# Capture the persistent-kernel register usage before any consumer compiles.
+# The value is a conservative fallback (0) when no capture is possible, e.g. in
+# the CPU-only configuration.
+include(GraphRegisters)
+graph_capture_kernel_registers(_graph_kernel_registers)
+target_compile_definitions(
+    graph
+    INTERFACE GRAPH_KERNEL_REGISTERS=${_graph_kernel_registers}
+              GRAPH_KERNEL_REGISTERS_FALLBACK=${GRAPH_KERNEL_REGISTERS_FALLBACK}
+)
+
 include(CTest)
 
 if(BUILD_TESTING)

@@ -15,6 +15,7 @@ target_compile_definitions(
     graph
     INTERFACE GRAPH_HAS_CUDA=$<BOOL:${GRAPH_ENABLE_CUDA}>
               GRAPH_HAS_OPENMP=$<BOOL:${GRAPH_ENABLE_OPENMP}>
+              GRAPH_ENABLE_MULTI_WARP_BLOCKS=$<BOOL:${GRAPH_ENABLE_MULTI_WARP_BLOCKS}>
 )
 
 # Consumers must call this after linking graph::graph. It is the project-wide

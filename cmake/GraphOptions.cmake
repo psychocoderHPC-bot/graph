@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: MPL-2.0
 
 option(GRAPH_ENABLE_CUDA "Enable the NVIDIA CUDA backend" OFF)
+option(
+    GRAPH_ENABLE_MULTI_WARP_BLOCKS
+    "Allow multi-warp persistent blocks (requires a validated warp-local barrier)"
+    OFF
+)
 
 find_package(OpenMP QUIET COMPONENTS CXX)
 if(OpenMP_CXX_FOUND)
