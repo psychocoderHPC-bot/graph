@@ -12,3 +12,9 @@ target_link_libraries(test_vocabulary PRIVATE graph::graph Catch2::Catch2WithMai
 graph_finalize(test_vocabulary)
 
 catch_discover_tests(test_vocabulary PROPERTIES TIMEOUT 120)
+
+add_executable(test_chunk_assembly unit/test_chunk_assembly.cpp)
+target_link_libraries(test_chunk_assembly PRIVATE graph::graph Catch2::Catch2WithMain)
+graph_finalize(test_chunk_assembly)
+
+catch_discover_tests(test_chunk_assembly PROPERTIES TIMEOUT 300)
