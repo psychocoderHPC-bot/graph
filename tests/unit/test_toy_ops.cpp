@@ -153,13 +153,53 @@ TEST_CASE("toy_ops source reports request overflow and out-of-range ids", "[grap
     REQUIRE((plan.errorFlags & graph::toy::toyErrorRequestOverflow) != 0u);
 
     graph::RequestSpec const request{0u, 8u, 0u};
-    auto const limited = graph::toy::toySourceEmit(request, buffer.data(), 8u, 8u, 4u);
-    REQUIRE(limited.emitted == 8u);
+    // Size the buffer from the capacity the emit call declares. The emit path
+    // promises never to write beyond that declared capacity.
+    constexpr std::uint32_t declaredCapacity = 8u;
+    std::vector<ToyItem> sizedFromCapacity(declaredCapacity);
+    auto const limited
+        = graph::toy::toySourceEmit(request, sizedFromCapacity.data(), declaredCapacity, declaredCapacity, 4u);
+    REQUIRE(limited.emitted == declaredCapacity);
     REQUIRE((limited.errorFlags & graph::toy::toyErrorIdOutOfRange) != 0u);
+    REQUIRE((limited.errorFlags & graph::toy::toyErrorOutputOverflow) == 0u);
 
     graph::toy::ToyInstrumentation control{};
     graph::toy::toyMergeErrorWord(control, limited.errorFlags);
     REQUIRE((control.errorWord & graph::toy::toyErrorIdOutOfRange) != 0u);
+}
+
+TEST_CASE("toy_ops source never writes past a declared capacity", "[graph][toy]")
+{
+    // The request needs a full chunk of 8 items, but the caller declares room
+    // for only 4. The emit path must clamp to the declared capacity, report the
+    // overflow error bit, and leave the canary region untouched.
+    constexpr std::uint32_t declaredCapacity = 4u;
+    constexpr std::uint32_t bufferSize = 8u;
+    constexpr std::uint64_t canary = 0xC0'FFEEu;
+
+    std::vector<ToyItem> buffer(bufferSize);
+    for(std::uint32_t i = 0u; i < bufferSize; ++i)
+        buffer[i] = ToyItem{canary, static_cast<std::uint32_t>(canary), static_cast<std::uint32_t>(canary)};
+
+    graph::RequestSpec const request{0u, 8u, 0u};
+    auto const plan = graph::toy::toySourceEmit(request, buffer.data(), declaredCapacity, 8u, 0u);
+
+    REQUIRE(plan.emitted == declaredCapacity);
+    REQUIRE((plan.errorFlags & graph::toy::toyErrorOutputOverflow) != 0u);
+    REQUIRE(plan.continuation.firstId == declaredCapacity);
+    REQUIRE(plan.continuation.count == 4u);
+
+    for(std::uint32_t i = 0u; i < declaredCapacity; ++i)
+    {
+        REQUIRE(buffer[i].id == i);
+        REQUIRE(buffer[i].value == graph::toy::toyValue(i, 0u));
+    }
+    for(std::uint32_t i = declaredCapacity; i < bufferSize; ++i)
+    {
+        REQUIRE(buffer[i].id == canary);
+        REQUIRE(buffer[i].value == static_cast<std::uint32_t>(canary));
+        REQUIRE(buffer[i].visit == static_cast<std::uint32_t>(canary));
+    }
 }
 
 TEST_CASE("toy_ops pass-through copies unchanged to the routed bin", "[graph][toy]")

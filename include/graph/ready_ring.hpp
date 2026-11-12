@@ -243,8 +243,10 @@ namespace graph
          * On `Full` the ring is at capacity; the caller backs off and retries.
          * On `Contended` another warp holds the lock; the caller backs off.
          */
-        ALPAKA_FN_ACC constexpr RingStatus enqueue(Acc const& acc, WarpGroup<Acc> const& warp, ReadyEntry const& entry)
-            noexcept
+        ALPAKA_FN_ACC constexpr RingStatus enqueue(
+            Acc const& acc,
+            WarpGroup<Acc> const& warp,
+            ReadyEntry const& entry) noexcept
         {
             RingStatus status = RingStatus::Contended;
             if(warp.isLeader())
@@ -297,7 +299,10 @@ namespace graph
          * On `Empty` the ring has no in-flight entry. On `Contended` another
          * warp holds the lock.
          */
-        ALPAKA_FN_ACC constexpr RingStatus dequeue(Acc const& acc, WarpGroup<Acc> const& warp, ReadyEntry& out) noexcept
+        ALPAKA_FN_ACC constexpr RingStatus dequeue(
+            Acc const& acc,
+            WarpGroup<Acc> const& warp,
+            ReadyEntry& out) noexcept
         {
             RingStatus status = RingStatus::Contended;
             if(warp.isLeader())
@@ -405,7 +410,7 @@ namespace graph
         {
             auto const value = static_cast<std::uint32_t>(status);
             auto const b = warp.template broadcast<std::uint32_t>(value, 0u);
-            (void)acc;
+            (void) acc;
             return static_cast<RingStatus>(b);
         }
 
@@ -420,15 +425,14 @@ namespace graph
         {
             if constexpr(Acc::getWarpSize() == 1u)
             {
-                (void)warp;
-                (void)entry;
+                (void) warp;
+                (void) entry;
             }
             else
             {
                 entry.operation.value = warp.template broadcast<std::uint32_t>(entry.operation.value, 0u);
-                entry.kind
-                    = static_cast<JobKind>(
-                        warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(entry.kind), 0u));
+                entry.kind = static_cast<JobKind>(
+                    warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(entry.kind), 0u));
                 entry.packet.index = warp.template broadcast<std::uint32_t>(entry.packet.index, 0u);
                 entry.packet.generation = warp.template broadcast<std::uint32_t>(entry.packet.generation, 0u);
                 entry.routing.inputPort = warp.template broadcast<std::uint32_t>(entry.routing.inputPort, 0u);

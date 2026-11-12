@@ -145,8 +145,7 @@ int main()
             worstBarrier = hostOut[2];
     }
 
-    std::cout << "width=" << hostOut[3]
-              << "  worstVoteInvisible=" << worstVote
+    std::cout << "width=" << hostOut[3] << "  worstVoteInvisible=" << worstVote
               << "  worstBarrierInvisible=" << worstBarrier << "\n";
     std::cout << "CONCLUSION: ";
     if(worstVote > 0u && worstBarrier == 0u)
@@ -156,7 +155,6 @@ int main()
         std::cout << "vote happened to order memory in this run (unreliable); "
                      "a vote still provides NO ordering guarantee.\n";
     else
-        std::cout << "unexpected: vote=" << worstVote << " barrier=" << worstBarrier
-                  << " - investigate\n";
+        std::cout << "unexpected: vote=" << worstVote << " barrier=" << worstBarrier << " - investigate\n";
     return 0;
 }

@@ -164,7 +164,7 @@ namespace
                 graph::PacketHandle stale{};
                 stale.index = 0u;
                 stale.generation = 999u; // never issued by this pool
-                (void)pool.release(acc, warp, stale);
+                (void) pool.release(acc, warp, stale);
             }
             barrier.barrier(acc, blockThreads, warp);
 
@@ -197,12 +197,12 @@ namespace
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
-        auto const* results = reinterpret_cast<std::uint64_t const*>(
-            hostBuffer.data() + Pool::storageBytes);
+        auto const* results = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + Pool::storageBytes);
 
-        INFO("cap=" << T_SlotCapacity << " elemCap=" << T_ElementCapacity << " configure=" << results[0]
-                    << " violations=" << results[1] << " acqOk=" << results[2] << " acqFail=" << results[3]
-                    << " relFail=" << results[4] << " peakHeld=" << results[5] << " freeCount=" << results[6]);
+        INFO(
+            "cap=" << T_SlotCapacity << " elemCap=" << T_ElementCapacity << " configure=" << results[0]
+                   << " violations=" << results[1] << " acqOk=" << results[2] << " acqFail=" << results[3]
+                   << " relFail=" << results[4] << " peakHeld=" << results[5] << " freeCount=" << results[6]);
         CHECK(results[0] == 1u);
         // Exactly one violation: the deliberate use-after-release hook.
         CHECK(results[1] == 1u);
@@ -276,11 +276,11 @@ namespace
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
-        auto const* results = reinterpret_cast<std::uint64_t const*>(
-            hostBuffer.data() + Pool::storageBytes);
+        auto const* results = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + Pool::storageBytes);
 
-        INFO("cap=" << T_SlotCapacity << " configure=" << results[0] << " violations=" << results[1]
-                    << " acquired=" << results[2] << " freeCount=" << results[3]);
+        INFO(
+            "cap=" << T_SlotCapacity << " configure=" << results[0] << " violations=" << results[1]
+                   << " acquired=" << results[2] << " freeCount=" << results[3]);
         CHECK(results[0] == 0u);
         CHECK(results[1] >= 1u);
         CHECK(results[2] == 0u);

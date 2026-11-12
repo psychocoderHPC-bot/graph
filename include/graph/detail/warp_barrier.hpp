@@ -60,8 +60,8 @@ namespace graph
          * the runtime warp width there is exactly one warp in the block and a
          * block barrier is a valid warp barrier.
          */
-        [[nodiscard]] ALPAKA_FN_ACC constexpr bool
-        isOneWarpPerBlock(Acc const& acc, std::uint32_t blockThreads) const noexcept
+        [[nodiscard]] ALPAKA_FN_ACC constexpr bool isOneWarpPerBlock(Acc const& acc, std::uint32_t blockThreads)
+            const noexcept
         {
             auto const width = alpaka::onAcc::warp::getSize(acc);
             return width == 1u || blockThreads == width;
@@ -75,18 +75,16 @@ namespace graph
          * (tripping `m_refused`) otherwise. It must not be called while the
          * caller holds any lock or is inside a wait or callback.
          */
-        ALPAKA_FN_ACC constexpr void barrier(
-            Acc const& acc,
-            std::uint32_t blockThreads,
-            WarpGroup<Acc> const& warp) const noexcept
+        ALPAKA_FN_ACC constexpr void barrier(Acc const& acc, std::uint32_t blockThreads, WarpGroup<Acc> const& warp)
+            const noexcept
         {
             auto const width = alpaka::onAcc::warp::getSize(acc);
             if(width <= 1u)
             {
                 // Host / single-lane warp: nothing to order.
-                (void)acc;
-                (void)blockThreads;
-                (void)warp;
+                (void) acc;
+                (void) blockThreads;
+                (void) warp;
                 return;
             }
             if(blockThreads == width)

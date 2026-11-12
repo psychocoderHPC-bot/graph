@@ -33,5 +33,5 @@ path = [
   "tests/reference/oracle.cpp",
   "tests/reference/test-vectors.md",
 ]
-SPDX-FileCopyrightText = "2026"
-SPDX-License-Identifier = "BSD-3-Clause"
+SPDX-FileCopyrightText = "2025 René Widera"
+SPDX-License-Identifier = "MPL-2.0"

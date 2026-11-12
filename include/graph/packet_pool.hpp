@@ -130,15 +130,24 @@ namespace graph
      * compile-time-checkable (all inputs are integers) and runtime-visible
      * (the pool exposes it through `requiredSlots()`).
      */
-    ALPAKA_FN_HOST_ACC constexpr std::uint32_t
-    requiredSlots(std::uint32_t P, std::uint32_t B, std::uint32_t W, std::uint32_t R, std::uint32_t S = 0u) noexcept
+    ALPAKA_FN_HOST_ACC constexpr std::uint32_t requiredSlots(
+        std::uint32_t P,
+        std::uint32_t B,
+        std::uint32_t W,
+        std::uint32_t R,
+        std::uint32_t S = 0u) noexcept
     {
         return P + 2u * B + W * R + S;
     }
 
     ALPAKA_FN_HOST_ACC constexpr std::uint32_t requiredSlots(PacketPoolBudget const& b) noexcept
     {
-        return requiredSlots(b.liveParticles, b.assemblyStreams, b.workers, b.replacementsPerWorker, b.controlAllowance);
+        return requiredSlots(
+            b.liveParticles,
+            b.assemblyStreams,
+            b.workers,
+            b.replacementsPerWorker,
+            b.controlAllowance);
     }
 
     namespace pool_detail
@@ -248,8 +257,10 @@ namespace graph
          * clamping. All lanes call it warp-uniformly; only the leader writes.
          * Returns `true` on success.
          */
-        ALPAKA_FN_ACC constexpr bool configure(Acc const& acc, WarpGroup<Acc> const& warp, PacketPoolBudget const& budget)
-            noexcept
+        ALPAKA_FN_ACC constexpr bool configure(
+            Acc const& acc,
+            WarpGroup<Acc> const& warp,
+            PacketPoolBudget const& budget) noexcept
         {
             bool ok = true;
             if(warp.isLeader())
@@ -369,8 +380,10 @@ namespace graph
          * violation in `violations`, leaves the free list untouched, and
          * returns false.
          */
-        ALPAKA_FN_ACC constexpr bool release(Acc const& acc, WarpGroup<Acc> const& warp, PacketHandle const& handle)
-            noexcept
+        ALPAKA_FN_ACC constexpr bool release(
+            Acc const& acc,
+            WarpGroup<Acc> const& warp,
+            PacketHandle const& handle) noexcept
         {
             bool ok = false;
             if(warp.isLeader())
@@ -383,8 +396,7 @@ namespace graph
                 {
                     auto* hdr = &header();
                     auto* slot = &slotAt(handle.index);
-                    auto const violation
-                        = slot->meta.generation != handle.generation || slot->meta.active == 0u;
+                    auto const violation = slot->meta.generation != handle.generation || slot->meta.active == 0u;
                     if(violation)
                     {
                         hdr->violations += 1u;
@@ -442,8 +454,7 @@ namespace graph
         }
 
         /** The slot's current record (the caller must hold the slot). */
-        [[nodiscard]] ALPAKA_FN_ACC constexpr PacketRecord const&
-        slotRecord(PacketHandle const& handle) const noexcept
+        [[nodiscard]] ALPAKA_FN_ACC constexpr PacketRecord const& slotRecord(PacketHandle const& handle) const noexcept
         {
             return slotAt(handle.index).record;
         }
@@ -520,8 +531,8 @@ namespace graph
         {
             if constexpr(Acc::getWarpSize() == 1u)
             {
-                (void)warp;
-                (void)handle;
+                (void) warp;
+                (void) handle;
             }
             else
             {

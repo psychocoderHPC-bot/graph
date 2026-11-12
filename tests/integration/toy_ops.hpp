@@ -213,6 +213,13 @@ namespace graph::toy
      * is complete. The request is emitted unchanged in that case. A request
      * whose `firstId + emitted` would wrap reports `toyErrorRequestOverflow`
      * and makes no progress.
+     *
+     * Contract: `capacity` is the number of `ToyItem` elements the caller
+     * allocated for the output buffer. The core never plans more items than
+     * that declared capacity. A request that needs more items than `capacity`
+     * for one invocation is clamped to `capacity` and reports
+     * `toyErrorOutputOverflow`; the unemitted remainder stays in the
+     * continuation.
      */
     ALPAKA_FN_HOST_ACC constexpr ToySourcePlan toySourcePlan(
         RequestSpec const& request,
@@ -221,8 +228,19 @@ namespace graph::toy
     {
         ToySourcePlan plan{};
         plan.continuation = request;
-        std::uint32_t limit = toyMin(capacity, maxPerInvocation);
-        if(limit == 0u || request.count == 0u)
+        if(request.count == 0u)
+            return plan;
+
+        // Number of items this invocation would emit before the
+        // caller-declared output capacity limits it.
+        std::uint64_t const requestable = request.count < static_cast<std::uint64_t>(maxPerInvocation)
+                                              ? request.count
+                                              : static_cast<std::uint64_t>(maxPerInvocation);
+        if(requestable > static_cast<std::uint64_t>(capacity))
+            plan.errorFlags |= toyErrorOutputOverflow;
+
+        std::uint32_t const limit = toyMin(capacity, maxPerInvocation);
+        if(limit == 0u)
             return plan;
 
         std::uint64_t const wanted
@@ -242,7 +260,13 @@ namespace graph::toy
         return plan;
     }
 
-    /** Pure source core: plan one invocation and write its items. */
+    /** Pure source core: plan one invocation and write its items.
+     *
+     * Contract: `capacity` is the number of `ToyItem` elements the caller
+     * allocated at `out`. This function writes at most that many elements and
+     * never past the declared bound. An undersized capacity is reported as
+     * `toyErrorOutputOverflow` by the planner, not by an out-of-bounds write.
+     */
     ALPAKA_FN_HOST_ACC constexpr ToySourcePlan toySourceEmit(
         RequestSpec const& request,
         ToyItem* out,
@@ -253,7 +277,8 @@ namespace graph::toy
         ToySourcePlan plan = toySourcePlan(request, capacity, maxPerInvocation);
         if(out == nullptr)
             return plan;
-        for(std::uint32_t i = 0u; i < plan.emitted; ++i)
+        std::uint32_t const writeCount = toyMin(plan.emitted, capacity);
+        for(std::uint32_t i = 0u; i < writeCount; ++i)
         {
             std::uint64_t const id = request.firstId + i;
             if(!toyIdInRange(id, idLimit))

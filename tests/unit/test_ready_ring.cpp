@@ -111,10 +111,8 @@ namespace
     template<std::size_t T_Capacity>
     struct RingSingleWarpKernel
     {
-        ALPAKA_FN_ACC void operator()(
-            auto const& acc,
-            alpaka::concepts::IMdSpan auto storage,
-            std::uint64_t itemCount) const
+        ALPAKA_FN_ACC void operator()(auto const& acc, alpaka::concepts::IMdSpan auto storage, std::uint64_t itemCount)
+            const
         {
             using Acc = std::remove_cvref_t<decltype(acc)>;
             using Ring = graph::ReadyRing<Acc, T_Capacity>;
@@ -148,14 +146,20 @@ namespace
                 if(warp.isLeader())
                 {
                     auto const v1 = static_cast<std::uint32_t>(s1);
-                    if(v1 == stAccepted) enqOk++;
-                    else if(v1 == stFull) enqFull++;
-                    else enqCont++;
+                    if(v1 == stAccepted)
+                        enqOk++;
+                    else if(v1 == stFull)
+                        enqFull++;
+                    else
+                        enqCont++;
 
                     auto const v2 = static_cast<std::uint32_t>(s2);
-                    if(v2 == stAccepted) deqOk++;
-                    else if(v2 == stEmpty) deqEmpty++;
-                    else deqCont++;
+                    if(v2 == stAccepted)
+                        deqOk++;
+                    else if(v2 == stEmpty)
+                        deqEmpty++;
+                    else
+                        deqCont++;
                 }
             }
 
@@ -181,27 +185,24 @@ namespace
     {
         auto device = makeTestDevice();
         using PlaceholderRing = graph::ReadyRing<int, T_Capacity>;
-        auto const totalBytes
-            = PlaceholderRing::storageBytes + 16 * sizeof(std::uint64_t);
+        auto const totalBytes = PlaceholderRing::storageBytes + 16 * sizeof(std::uint64_t);
 
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
         auto deviceBuffer = alpaka::onHost::allocLike(device, hostBuffer);
 
         launchOneWarp(device, RingSingleWarpKernel<T_Capacity>{}, deviceBuffer, itemCount);
-        alpaka::onHost::memcpy(
-            device.makeQueue(),
-            hostBuffer,
-            deviceBuffer);
+        alpaka::onHost::memcpy(device.makeQueue(), hostBuffer, deviceBuffer);
         alpaka::onHost::wait(device.makeQueue());
 
-        auto const* results = reinterpret_cast<std::uint64_t const*>(
-            hostBuffer.data() + PlaceholderRing::storageBytes);
+        auto const* results
+            = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + PlaceholderRing::storageBytes);
 
-        INFO("cap=" << T_Capacity << " items=" << itemCount << " enqOk=" << results[0] << " enqFull=" << results[1]
-                    << " enqCont=" << results[2] << " deqOk=" << results[3] << " deqEmpty=" << results[4]
-                    << " deqCont=" << results[5] << " inFlight=" << results[6] << " violations=" << results[7]
-                    << " barrierRefused=" << results[8]);
+        INFO(
+            "cap=" << T_Capacity << " items=" << itemCount << " enqOk=" << results[0] << " enqFull=" << results[1]
+                   << " enqCont=" << results[2] << " deqOk=" << results[3] << " deqEmpty=" << results[4]
+                   << " deqCont=" << results[5] << " inFlight=" << results[6] << " violations=" << results[7]
+                   << " barrierRefused=" << results[8]);
         CHECK(results[8] == 0u); // one warp per block: the barrier must not refuse
         CHECK(results[0] == itemCount);
         CHECK(results[3] == itemCount);
@@ -222,10 +223,8 @@ namespace
     template<std::size_t T_Capacity>
     struct RingEmptyFullKernel
     {
-        ALPAKA_FN_ACC void operator()(
-            auto const& acc,
-            alpaka::concepts::IMdSpan auto storage,
-            std::uint64_t itemCount) const
+        ALPAKA_FN_ACC void operator()(auto const& acc, alpaka::concepts::IMdSpan auto storage, std::uint64_t itemCount)
+            const
         {
             using Acc = std::remove_cvref_t<decltype(acc)>;
             using Ring = graph::ReadyRing<Acc, T_Capacity>;
@@ -261,8 +260,10 @@ namespace
                 if(warp.isLeader())
                 {
                     auto const v = static_cast<std::uint32_t>(s);
-                    if(v == stAccepted) enqOk++;
-                    else if(v == stFull) enqFull++;
+                    if(v == stAccepted)
+                        enqOk++;
+                    else if(v == stFull)
+                        enqFull++;
                 }
             }
 
@@ -275,8 +276,10 @@ namespace
                 if(warp.isLeader())
                 {
                     auto const v = static_cast<std::uint32_t>(s);
-                    if(v == stAccepted) deqOk++;
-                    else if(v == stEmpty) deqEmpty++;
+                    if(v == stAccepted)
+                        deqOk++;
+                    else if(v == stEmpty)
+                        deqEmpty++;
                 }
             }
 
@@ -308,11 +311,12 @@ namespace
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
-        auto const* results = reinterpret_cast<std::uint64_t const*>(
-            hostBuffer.data() + PlaceholderRing::storageBytes);
+        auto const* results
+            = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + PlaceholderRing::storageBytes);
 
-        INFO("cap=" << T_Capacity << " enqOk=" << results[0] << " enqFull=" << results[1] << " deqOk=" << results[2]
-                    << " deqEmpty=" << results[3] << " inFlight=" << results[4]);
+        INFO(
+            "cap=" << T_Capacity << " enqOk=" << results[0] << " enqFull=" << results[1] << " deqOk=" << results[2]
+                   << " deqEmpty=" << results[3] << " inFlight=" << results[4]);
         CHECK(results[0] == T_Capacity);
         CHECK(results[1] >= 1u);
         CHECK(results[2] == T_Capacity);
@@ -336,10 +340,8 @@ namespace
     template<std::size_t T_Capacity>
     struct RingWrapKernel
     {
-        ALPAKA_FN_ACC void operator()(
-            auto const& acc,
-            alpaka::concepts::IMdSpan auto storage,
-            std::uint64_t itemCount) const
+        ALPAKA_FN_ACC void operator()(auto const& acc, alpaka::concepts::IMdSpan auto storage, std::uint64_t itemCount)
+            const
         {
             using Acc = std::remove_cvref_t<decltype(acc)>;
             using Ring = graph::ReadyRing<Acc, T_Capacity>;
@@ -364,8 +366,10 @@ namespace
                 barrier.barrier(acc, blockThreads, warp);
                 if(warp.isLeader())
                 {
-                    if(static_cast<std::uint32_t>(s1) == stAccepted) enqOk++;
-                    if(static_cast<std::uint32_t>(s2) == stAccepted) deqOk++;
+                    if(static_cast<std::uint32_t>(s1) == stAccepted)
+                        enqOk++;
+                    if(static_cast<std::uint32_t>(s2) == stAccepted)
+                        deqOk++;
                 }
             }
 
@@ -398,12 +402,13 @@ namespace
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
-        auto const* results = reinterpret_cast<std::uint64_t const*>(
-            hostBuffer.data() + PlaceholderRing::storageBytes);
+        auto const* results
+            = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + PlaceholderRing::storageBytes);
 
-        INFO("cap=" << T_Capacity << " items=" << itemCount << " enqOk=" << results[0] << " deqOk=" << results[1]
-                    << " push=" << results[2] << " claim=" << results[3] << " inFlight=" << results[4]
-                    << " violations=" << results[5]);
+        INFO(
+            "cap=" << T_Capacity << " items=" << itemCount << " enqOk=" << results[0] << " deqOk=" << results[1]
+                   << " push=" << results[2] << " claim=" << results[3] << " inFlight=" << results[4]
+                   << " violations=" << results[5]);
         CHECK(results[0] == itemCount);
         CHECK(results[1] == itemCount);
         CHECK(results[2] == itemCount);
@@ -427,10 +432,8 @@ namespace
     template<std::size_t T_Capacity>
     struct RingExactOnceKernel
     {
-        ALPAKA_FN_ACC void operator()(
-            auto const& acc,
-            alpaka::concepts::IMdSpan auto storage,
-            std::uint64_t itemCount) const
+        ALPAKA_FN_ACC void operator()(auto const& acc, alpaka::concepts::IMdSpan auto storage, std::uint64_t itemCount)
+            const
         {
             using Acc = std::remove_cvref_t<decltype(acc)>;
             using Ring = graph::ReadyRing<Acc, T_Capacity>;
@@ -525,12 +528,13 @@ namespace
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
-        auto const* results = reinterpret_cast<std::uint64_t const*>(
-            hostBuffer.data() + PlaceholderRing::storageBytes);
+        auto const* results
+            = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + PlaceholderRing::storageBytes);
 
-        INFO("cap=" << T_Capacity << " items=" << itemCount << " enqOk=" << results[0] << " deqOk=" << results[1]
-                    << " payload/order errors=" << results[2] << " duplicates=" << results[3]
-                    << " missing=" << results[4] << " violations=" << results[5]);
+        INFO(
+            "cap=" << T_Capacity << " items=" << itemCount << " enqOk=" << results[0] << " deqOk=" << results[1]
+                   << " payload/order errors=" << results[2] << " duplicates=" << results[3]
+                   << " missing=" << results[4] << " violations=" << results[5]);
         CHECK(results[0] == itemCount);
         CHECK(results[1] == itemCount);
         CHECK(results[2] == 0u);

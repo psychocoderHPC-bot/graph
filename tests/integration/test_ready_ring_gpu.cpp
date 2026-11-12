@@ -138,7 +138,7 @@ namespace
             if(warp.isLeader())
             {
                 std::uint64_t guard = 0u;
-                while(reinterpret_cast<std::uint64_t volatile const&>(arrival->ready) < numBlocks
+                while(reinterpret_cast<std::uint64_t const volatile&>(arrival->ready) < numBlocks
                       && guard++ < 1u << 26u)
                 {
                     // bounded poll
@@ -305,10 +305,11 @@ namespace
         for(std::size_t c = 0u; c < numProducers; ++c)
             totalWordErrors += r[c];
 
-        INFO("blocks=" << numBlocks << " entriesPerBlock=" << entriesPerBlock << " totalItems=" << totalItems
-                       << " claimed=" << r[numProducers] << " pushed=" << r[numProducers + 1]
-                       << " wordErrors=" << totalWordErrors << " duplicates=" << r[numProducers + 2]
-                       << " timeouts=" << r[numProducers + 5] << " pushFails=" << r[numProducers + 6]);
+        INFO(
+            "blocks=" << numBlocks << " entriesPerBlock=" << entriesPerBlock << " totalItems=" << totalItems
+                      << " claimed=" << r[numProducers] << " pushed=" << r[numProducers + 1]
+                      << " wordErrors=" << totalWordErrors << " duplicates=" << r[numProducers + 2]
+                      << " timeouts=" << r[numProducers + 5] << " pushFails=" << r[numProducers + 6]);
 
         CHECK(r[numProducers + 5] == 0u); // no consumer timed out
         CHECK(r[numProducers + 6] == 0u); // no producer failed
