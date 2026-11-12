@@ -18,7 +18,19 @@ function(graph_add_test_target directory sources)
     set(_graph_test_target "graph_${directory}_tests")
     add_executable(${_graph_test_target} ${sources})
     target_link_libraries(${_graph_test_target} PRIVATE graph::graph Catch2::Catch2WithMain)
-    target_include_directories(${_graph_test_target} PRIVATE "${PROJECT_SOURCE_DIR}/examples")
+
+    # Tests share headers across directories: the unit tests use the scripted
+    # integration fixture (toy_ops.hpp) and the integration tests use the
+    # scalar reference oracle (oracle.hpp). The example tree is header-only and
+    # has no target of its own.
+    target_include_directories(
+        ${_graph_test_target}
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/examples"
+            "${CMAKE_CURRENT_SOURCE_DIR}/unit"
+            "${CMAKE_CURRENT_SOURCE_DIR}/integration"
+            "${CMAKE_CURRENT_SOURCE_DIR}/reference"
+    )
     graph_finalize(${_graph_test_target})
 
     catch_discover_tests(${_graph_test_target} PROPERTIES TIMEOUT 300)
