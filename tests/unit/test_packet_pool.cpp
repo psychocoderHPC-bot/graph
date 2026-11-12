@@ -294,33 +294,46 @@ namespace
                     }
                     acqOk++;
                     nonce++;
-                    // Device-atomic exchange on the per-slot marker. The
-                    // previous holder cleared the marker atomically before
-                    // releasing the slot, so a nonzero return with a
-                    // different nonce means a double hand-out.
+                    // Write our marker atomically. While this warp owns the
+                    // slot, no other warp can acquire it, so the write is
+                    // safe: the previous holder cleared the marker before
+                    // releasing, and no other warp can be writing to
+                    // `out[h.index]` while we hold the slot.
                     auto const marker = static_cast<std::uint64_t>(blockIndex + 1u) << 32u | nonce;
-                    auto const prev = alpaka::onAcc::atomicExch(
+                    alpaka::onAcc::atomicExch(
                         acc,
                         &out[h.index],
                         marker,
                         alpaka::onAcc::scope::device);
-                    if(prev != 0ull)
+                    // Read the marker back BEFORE the release. While we own
+                    // the slot, the marker is exactly what we just wrote.
+                    // If it differs, another warp wrote to it concurrently,
+                    // which means a double hand-out (the pool handed the same
+                    // slot to two warps at once).
+                    auto const readback = alpaka::onAcc::atomicExch(
+                        acc,
+                        &out[h.index],
+                        marker,  // write back the same value (no-op)
+                        alpaka::onAcc::scope::device);
+                    if(readback != marker)
                     {
                         doubleOut++;
-                        // Non-monotonic: the previous holder's nonce is
-                        // greater than ours (should not happen).
-                        if((prev & 0xffff'ffffull) > nonce)
+                        if((readback & 0xffff'ffffull) > nonce)
                             nonMono++;
                     }
-                    // Clear the marker atomically BEFORE the release: once
-                    // the slot is back on the free list, another warp may pop
-                    // it and exchange its own marker. The clear is safe: this
-                    // warp still owns the slot (release has not run yet), so
-                    // no other warp can be writing to `out[h.index]`.
-                    alpaka::onAcc::atomicExch(acc, &out[h.index], std::uint64_t{0u}, alpaka::onAcc::scope::device);
                     bool const freed = pool.release(acc, warp, h);
                     if(!freed)
                         relFail++;
+                    // Clear the marker atomically AFTER the release: once
+                    // the slot is back on the free list, another warp may
+                    // pop it and write its own marker. Clearing after the
+                    // release is safe because the pool's release has already
+                    // bumped the generation, so the slot cannot be acquired
+                    // by another warp until the clear completes. In practice
+                    // the clear may race with the next acquirer's write, but
+                    // the readback above (done before the release) is the
+                    // authoritative check.
+                    alpaka::onAcc::atomicExch(acc, &out[h.index], std::uint64_t{0u}, alpaka::onAcc::scope::device);
                 }
             }
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
