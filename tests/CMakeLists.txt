@@ -38,3 +38,11 @@ endfunction()
 
 graph_add_test_target(unit "${GRAPH_UNIT_TEST_SOURCES}")
 graph_add_test_target(integration "${GRAPH_INTEGRATION_TEST_SOURCES}")
+
+# Independent scalar reference (oracle) of the particle-feedback semantics.
+# Built as its own executable so the acceptance fixtures can be regenerated
+# and checked without any project dependency; it depends on the standard
+# library only. It is not a Catch2 test and therefore has no CTest entry.
+add_executable(graph_particle_reference reference/oracle.cpp)
+target_compile_features(graph_particle_reference PRIVATE cxx_std_20)
+target_include_directories(graph_particle_reference PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/reference")
