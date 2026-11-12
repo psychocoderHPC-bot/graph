@@ -7,6 +7,7 @@
 
 #include <graph/detail/concepts.hpp>
 #include <graph/detail/packet.hpp>
+#include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
 
 #include <cstddef>
@@ -54,10 +55,30 @@
  * The initial worker layout is one hardware warp per block. All entry points
  * are warp-uniform: every active lane of the calling warp must execute them.
  * `isOneWarpPerBlockLayout()` asserts the layout for tests and startup checks.
- * No block-wide barrier is used. The commit and flush paths execute a
- * device-scope release fence after the lane writes and before the leader
- * publishes chunk descriptors; the consumer side of a publication still uses
- * the scheduler's acquire chain.
+ *
+ * # Lane publication ordering
+ *
+ * The lanes of a worker warp write chunk elements through
+ * `StreamReservation::writePointer()`, and the leader alone moves the stream
+ * slots and hands the publication descriptor downstream. The chain that makes
+ * every lane's element stores visible to that downstream consumer is:
+ *
+ * 1. every lane finishes its element stores;
+ * 2. `WarpBarrier::barrier()` (`graph/detail/warp_barrier.hpp`) orders the
+ *    lanes against each other. A device-scope release fence cannot stand in
+ *    here, because a fence orders only the executing thread's own prior
+ *    writes, and a warp vote (`WarpGroup::all`) observes predicates and
+ *    orders nothing; and
+ * 3. the leader's device-scope release fence orders its own metadata
+ *    publication (slot moves, the publication descriptor) after everything
+ *    the barrier ordered; a downstream consumer acquires through the
+ *    scheduler's acquire chain.
+ *
+ * `commit()` and `flushPartial()` both execute that chain. A `WarpBarrier`
+ * instance is per-warp local state, so every caller owns one and its
+ * `refused()` flag must be checked by the caller (a kernel may assert on
+ * it); the barrier refuses a multi-warp block instead of falling back to a
+ * vote or an over-wide block barrier.
  */
 namespace graph
 {
@@ -404,7 +425,16 @@ namespace graph
         {
             std::uint32_t status = static_cast<std::uint32_t>(FlushStatus::InvalidStream);
             ChunkSlot<T> result{};
-            alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
+            auto const blockThreads = static_cast<std::uint32_t>(
+                acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+            // The lanes wrote the chunk elements this flush publishes. The
+            // barrier orders those stores across the lanes; it is what makes
+            // every lane's writes visible before the leader publishes the
+            // descriptor below. The release fence after the barrier then
+            // orders the leader's own metadata publication after the ordered
+            // element writes.
+            WarpBarrier<T_Acc> barrier{};
+            barrier.barrier(acc, blockThreads, warp);
             if(warp.isLeader())
             {
                 if(validStreamIndex(index) && ownerToken != 0u)
@@ -417,6 +447,12 @@ namespace graph
                         {
                             applyFlush(state, replacement);
                         }
+                        // The leader's own release fence: orders its metadata
+                        // publication (applyFlush and the claim release) after
+                        // the lane element stores the barrier ordered above.
+                        // The downstream consumer of the published chunk
+                        // acquires through the scheduler's acquire chain.
+                        alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
                         releaseClaim(acc, &state.claim, ownerToken);
                     }
                     else
@@ -702,14 +738,32 @@ namespace graph
          * The caller must have finished all writes first. Warp-uniform; only
          * the leader mutates state. On success the input packet may be retired
          * with `retireInput()`.
+         *
+         * The lane element stores written through `writePointer()` are
+         * ordered across the lanes by the `WarpBarrier` before the leader
+         * moves any slot or hands a publication descriptor downstream; the
+         * leader then release-fences its own metadata publication. The
+         * downstream consumer of a published chunk acquires through the
+         * scheduler's acquire chain. If the `valid` re-check below fails
+         * (another warp committed to the same stream between the reservation
+         * and this commit), no stream state is mutated at all: the claims are
+         * released, the reservation is `Failed`, and the caller may
+         * `cancel()` it.
          */
         template<typename T_Acc>
         ALPAKA_FN_ACC bool commit(T_Acc const& acc, WarpGroup<T_Acc> const& warp) noexcept
         {
             bool ok = false;
-            // Order every lane's element stores before the leader moves slots.
-            alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
-            (void) warp.all(true);
+            auto const blockThreads = static_cast<std::uint32_t>(
+                acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+            // Order the lanes: the barrier is what makes every lane's element
+            // stores ordered before the leader publishes below. A vote
+            // (`warp.all`) would observe predicates and order nothing, and a
+            // device-scope release fence orders only the executing thread's
+            // own prior writes, so neither could publish the other lanes'
+            // stores.
+            WarpBarrier<T_Acc> barrier{};
+            barrier.barrier(acc, blockThreads, warp);
             if(warp.isLeader())
             {
                 if(m_status == Status::Pending)
@@ -723,6 +777,12 @@ namespace graph
                     }
                     if(valid)
                     {
+                        // The leader's own release fence: orders its metadata
+                        // publication (the slot moves in applyTarget and the
+                        // publication descriptors) after the lane element
+                        // stores the barrier ordered. The downstream consumer
+                        // acquires through the scheduler's acquire chain.
+                        alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
                         for(std::uint32_t i = 0u; i < m_targetCount; ++i)
                             applyTarget(i);
                         ok = true;
@@ -738,11 +798,16 @@ namespace graph
             ok = warp.template broadcast<std::uint32_t>(ok ? 1u : 0u, 0u) != 0u;
             m_status = static_cast<Status>(
                 warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(m_status), 0u));
-            (void) warp.all(true);
             return ok;
         }
 
-        /** Release all claims without committing. */
+        /** Release all claims without committing.
+         *
+         * No barrier is needed here: the claims are the only thing a
+         * concurrent reader observes, and the claim CAS already orders them.
+         * The broadcast at the end is the convergence point, not an ordering
+         * primitive.
+         */
         template<typename T_Acc>
         ALPAKA_FN_ACC void cancel(T_Acc const& acc, WarpGroup<T_Acc> const& warp) noexcept
         {
@@ -760,7 +825,6 @@ namespace graph
             }
             m_status = static_cast<Status>(
                 warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(m_status), 0u));
-            (void) warp.all(true);
         }
 
         /** Retire the input packet exactly once after a successful commit.

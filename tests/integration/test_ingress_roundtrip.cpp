@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <graph/ingress_ring.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -206,6 +207,44 @@ namespace
             }
         }
     };
+
+    /** Resolver that rejects the descriptor with sequence number one. */
+    struct RejectSequenceOne
+    {
+        ALPAKA_FN_ACC bool operator()(Descriptor const& descriptor) const noexcept
+        {
+            return descriptor.sequenceNumber != 1u;
+        }
+    };
+
+    /** One-shot importer: the first poll rejects, the second poll accepts all.
+     *
+     * flags layout: [0] first status, [1] first error, [2] first imported,
+     * [3] second status, [4] second imported, [5] second error.
+     */
+    struct ErrorPathKernel
+    {
+        ALPAKA_FN_ACC void operator()(
+            auto const& acc,
+            typename Ring::View view,
+            Descriptor* staging,
+            std::uint32_t* flags) const
+        {
+            if(alpaka::onAcc::warp::getLaneIdx(acc) != 0u)
+                return;
+
+            graph::ImportBatch const rejected
+                = view.pollAndImport(acc, staging, stagingCapacity, maxBatch, RejectSequenceOne{});
+            graph::systemStoreRelease(acc, flags + 0u, static_cast<std::uint32_t>(rejected.status));
+            graph::systemStoreRelease(acc, flags + 1u, static_cast<std::uint32_t>(rejected.error));
+            graph::systemStoreRelease(acc, flags + 2u, rejected.imported);
+
+            graph::ImportBatch const accepted = view.pollAndImport(acc, staging, stagingCapacity, maxBatch);
+            graph::systemStoreRelease(acc, flags + 3u, static_cast<std::uint32_t>(accepted.status));
+            graph::systemStoreRelease(acc, flags + 4u, accepted.imported);
+            graph::systemStoreRelease(acc, flags + 5u, static_cast<std::uint32_t>(accepted.error));
+        }
+    };
 } // namespace
 
 TEST_CASE("ingress round trip preserves order, exactly once, and close last", "[ingress][roundtrip]")
@@ -379,4 +418,59 @@ TEST_CASE("ingress round trip preserves order, exactly once, and close last", "[
     std::cout << (GRAPH_HAS_CUDA ? "CUDA device warp import evidence" : "CPU host-importer path (not GPU evidence)")
               << ": imported=" << total32 << " expected=" << (userJobs + 1u)
               << " ordered_exactly_once=yes close_marker_last=yes consumed_progress_observed=yes" << std::endl;
+}
+
+TEST_CASE("ingress import error is reported and leaves the ring usable", "[ingress][roundtrip]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring::create(device);
+
+    std::array<Descriptor, 3u> jobs{makeDescriptorValue(0u), makeDescriptorValue(1u), makeDescriptorValue(2u)};
+    auto const enqueued = ring.tryEnqueue(std::span<Descriptor const>{jobs.data(), jobs.size()});
+    REQUIRE(enqueued.status == graph::EnqueueStatus::accepted);
+    REQUIRE(enqueued.accepted == 3u);
+
+    // Mapped staging so the same buffer serves the device poll and the host
+    // importer check below.
+    auto staging = alpaka::onHost::allocMapped<Descriptor>(device, alpaka::Vec<std::uint32_t, 1u>{stagingCapacity});
+    auto flagBuffer = alpaka::onHost::allocMapped<std::uint32_t>(device, alpaka::Vec<std::uint32_t, 1u>{8u});
+    auto* flags = alpaka::onHost::data(flagBuffer);
+    for(std::uint32_t i = 0u; i < 8u; ++i)
+        hostFlagStore(flags + i, 0u);
+
+    auto queue = device.makeQueue();
+    queue.enqueue(makeLaunchCfg(), ErrorPathKernel{}, ring.view(), alpaka::onHost::data(staging), flags);
+    alpaka::onHost::wait(queue);
+
+    auto const firstStatus = hostFlagLoad(flags + 0u);
+    auto const firstError = hostFlagLoad(flags + 1u);
+    auto const firstImported = hostFlagLoad(flags + 2u);
+    auto const secondStatus = hostFlagLoad(flags + 3u);
+    auto const secondImported = hostFlagLoad(flags + 4u);
+    auto const secondError = hostFlagLoad(flags + 5u);
+
+    CHECK(firstStatus == static_cast<std::uint32_t>(graph::ImportStatus::error));
+    CHECK(firstError == static_cast<std::uint32_t>(graph::IngressError::invalid_descriptor));
+    CHECK(firstImported == 0u);
+    // The second poll re-imports the same three descriptors, so the first poll
+    // acknowledged nothing.
+    CHECK(secondStatus == static_cast<std::uint32_t>(graph::ImportStatus::imported));
+    CHECK(secondImported == 3u);
+    CHECK(secondError == static_cast<std::uint32_t>(graph::IngressError::none));
+
+    CHECK(ring.consumed() == 3u);
+    CHECK(ring.published() == 3u);
+    CHECK(ring.occupancy() == 0u);
+
+    // The sticky error code is still observable from the host after the fact,
+    // and the ring keeps accepting and importing new work.
+    auto const counters = ring.debugCounters();
+    CHECK(counters.importError == graph::IngressError::invalid_descriptor);
+    CHECK(counters.totalImported == 3u);
+
+    auto const extra = makeDescriptorValue(3u);
+    CHECK(ring.tryEnqueue(std::span<Descriptor const>{&extra, 1u}).status == graph::EnqueueStatus::accepted);
+    REQUIRE(ring.view().pollAndImportHost(alpaka::onHost::data(staging), stagingCapacity, maxBatch).imported == 1u);
+    CHECK(descriptorEquals(*ring.descriptorSlot(3u), extra));
+    CHECK(ring.occupancy() == 0u);
 }
