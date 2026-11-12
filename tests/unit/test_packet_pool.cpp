@@ -358,9 +358,23 @@ namespace
                 (void) alpaka::onAcc::atomicAdd(acc, &results[2], relFail, alpaka::onAcc::scope::device);
                 (void) alpaka::onAcc::atomicAdd(acc, &results[3], doubleOut, alpaka::onAcc::scope::device);
                 (void) alpaka::onAcc::atomicAdd(acc, &results[4], nonMono, alpaka::onAcc::scope::device);
+                // Increment the done count: block 0 waits for all warps to
+                // finish before reading the final pool state.
+                (void) alpaka::onAcc::atomicAdd(acc, &results[11], std::uint64_t{1u}, alpaka::onAcc::scope::device);
             }
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::acquire);
+
+            // Grid-wide barrier: block 0 spins until all warps have finished.
+            if(blockIndex == 0u && warp.isLeader())
+            {
+                auto const totalWarps = static_cast<std::uint64_t>(gridBlocks);
+                auto volatile* doneCount = reinterpret_cast<std::uint64_t volatile*>(&results[11]);
+                while(*doneCount < totalWarps)
+                {
+                    alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::acquire);
+                }
+            }
 
             if(blockIndex == 0u && warp.isLeader())
             {
@@ -469,7 +483,7 @@ namespace
     {
         auto device = makeTestDevice();
         using Pool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
-        auto const totalBytes = Pool::storageBytes + 11 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
+        auto const totalBytes = Pool::storageBytes + 12 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
 
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
