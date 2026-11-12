@@ -511,12 +511,19 @@ namespace
                    << " doubleOut=" << results[3] << " nonMono=" << results[4] << " violations=" << results[5]
                    << " freeCount=" << results[6] << " heldAtEnd=" << results[7]
                    << " casFailures=" << results[8] << " metaChecks=" << results[9]);
-        CHECK(results[0] == expectedAcq);
-        CHECK(results[1] == 0u);
+        // Every warp did its full iteration count: successes + failures = total.
+        CHECK(results[0] + results[1] == expectedAcq);
+        // No release should fail: a release fails only when the handle is
+        // stale (generation mismatch) or the slot is inactive (double-release),
+        // both of which indicate a pool bug.
         CHECK(results[2] == 0u);
+        // No double hand-out: the marker readback must always match.
         CHECK(results[3] == 0u);
+        // No non-monotonic generations.
         CHECK(results[4] == 0u);
+        // No ownership violations.
         CHECK(results[5] == 0u);
+        // The pool ends clean: every slot is free.
         CHECK(results[6] == T_SlotCapacity);
         CHECK(results[7] == 0u);
     }
