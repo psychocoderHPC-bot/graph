@@ -1,0 +1,239 @@
+# SPDX-FileCopyrightText: 2026 René Widera and contributors
+# SPDX-License-Identifier: MPL-2.0
+#
+# GitLab CI for the graph repository.
+#
+# PENDING OPERATOR ACTIONS -- the workflow below is committed, the
+# infrastructure behind it is not provisioned yet:
+#
+#   1. Connect a GitLab CI project to https://github.com/psychocoderHPC-bot/graph
+#      through GitLab's GitHub integration (or the established mirror + trigger
+#      workflow) and enable pipeline status reporting for the GitHub commit.
+#      See docs/ci.md.
+#   2. Register a HAL CPU runner with the tags used by test:hal:cpu:
+#          hal  cpuonly  x86_64
+#      Replace the placeholder `tags:` blocks below if the operator provisions
+#      different tag names.
+#   3. Register a HAL NVIDIA runner with the tags used by test:hal:nvidia:
+#          hal  cuda  nvidia
+#      The runner must expose the A30 GPU as CUDA device 0.
+#   4. Provide (and confirm the digest of) the CUDA devel image used by
+#      test:hal:nvidia; the image below is a placeholder tag, not a digest.
+#   5. Enable shared runners, or point format/reuse/test:cpu at runners with the
+#      same tags as the HAL CPU runner if no shared runners are allowed.
+#
+# Until those steps are done no complete pipeline result exists. The HAL jobs
+# stay pending because no runner matches their tags; that pending state is the
+# visible, unfulfilled hardware gate. Do not mark the pipeline green by
+# dropping the HAL jobs.
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Avoid a second branch pipeline for a branch that already has an MR.
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^warp-pool\//'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - when: never
+
+stages:
+  - lint
+  - test
+
+variables:
+  # The pipeline must validate the exact commit that was pushed. Keep enough
+  # history for the runner to check out CI_COMMIT_SHA and verify it below.
+  GIT_DEPTH: "50"
+  GIT_SUBMODULE_STRATEGY: "none"
+  # Do not use FetchContent's shallow clones; the alpaka and Catch2 pins are
+  # commit hashes and need a real fetch.
+  GIT_TERMINAL_PROMPT: "0"
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+
+# Shared rule set for every job: merge requests, the default branch,
+# warp-pool branches, tags, and manual or scheduled pipelines.
+.ci-rules:
+  rules: &ci_rules
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^warp-pool\//'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - when: never
+
+# Common setup for the CPU-side jobs.
+.prepare-cpu:
+  before_script:
+    - apt-get update -qq
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends
+      build-essential cmake ninja-build git ca-certificates
+    - cmake --version
+    - c++ --version
+
+# Common setup for the CUDA job. The image ships nvcc; CMake and Ninja come from
+# the distribution so the local and CI configure steps stay identical.
+.prepare-cuda:
+  before_script:
+    - apt-get update -qq
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends
+      build-essential cmake ninja-build git ca-certificates
+    - cmake --version
+    - nvcc --version
+
+format:
+  stage: lint
+  image: python:3.13-slim
+  before_script:
+    - apt-get update -qq
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends
+      git ca-certificates
+    # Pinned formatter: .clang-format came from alpaka at the pinned revision,
+    # which requires clang-format 20.
+    - pip install --no-cache-dir --disable-pip-version-check "clang-format==20.1.8"
+    - clang-format --version
+  script:
+    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+      || { echo "checked out $(git rev-parse HEAD), expected CI_COMMIT_SHA $CI_COMMIT_SHA"; exit 1; }
+    - scripts/check-format.sh
+  timeout: 20 minutes
+  interruptible: true
+  rules: *ci_rules
+
+reuse:
+  stage: lint
+  image: python:3.13-slim
+  before_script:
+    - apt-get update -qq
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends
+      git ca-certificates
+    # Pinned REUSE tool. Update together with the REUSE.toml schema if needed.
+    - pip install --no-cache-dir --disable-pip-version-check "reuse==6.3.0"
+    - reuse --version
+  script:
+    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+      || { echo "checked out $(git rev-parse HEAD), expected CI_COMMIT_SHA $CI_COMMIT_SHA"; exit 1; }
+    - scripts/reuse-lint.sh
+  timeout: 20 minutes
+  interruptible: true
+  rules: *ci_rules
+
+test:cpu:
+  stage: test
+  image: ubuntu:24.04
+  extends: .prepare-cpu
+  script:
+    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+      || { echo "checked out $(git rev-parse HEAD), expected CI_COMMIT_SHA $CI_COMMIT_SHA"; exit 1; }
+    - cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DGRAPH_ENABLE_CUDA=OFF
+    - cmake --build build-cpu --parallel
+    - ctest --test-dir build-cpu --output-on-failure --output-junit junit.xml
+      --timeout 600 --no-tests=error
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - junit.xml
+      - build-cpu/Testing/Temporary/LastTest.log
+      - build-cpu/Testing/Temporary/LastTestsFailed.log
+    reports:
+      junit: junit.xml
+  timeout: 60 minutes
+  interruptible: true
+  rules: *ci_rules
+
+test:hal:cpu:
+  stage: test
+  image: ubuntu:24.04
+  extends: .prepare-cpu
+  tags:
+    # TODO(operator): replace with the registered HAL CPU runner tags.
+    - hal
+    - cpuonly
+    - x86_64
+  script:
+    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+      || { echo "checked out $(git rev-parse HEAD), expected CI_COMMIT_SHA $CI_COMMIT_SHA"; exit 1; }
+    - |
+      {
+        echo '$ nvidia-smi -q'
+        nvidia-smi -q 2>&1 || echo '(nvidia-smi unavailable)'
+        echo '$ nvcc --version'
+        nvcc --version 2>&1 || echo '(nvcc unavailable)'
+        echo '$ cmake --version'
+        cmake --version 2>&1 || true
+        echo '$ lscpu'
+        lscpu 2>&1 || true
+      } > hal-diagnostics.txt
+    # hal sources a oneAPI profile that pollutes the library search path; scrub
+    # it so the compiler and CMake use the system toolchain.
+    - env -u LD_LIBRARY_PATH -u CMAKE_PREFIX_PATH
+      cmake -S . -B build-hal-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DGRAPH_ENABLE_CUDA=OFF
+    - env -u LD_LIBRARY_PATH -u CMAKE_PREFIX_PATH cmake --build build-hal-cpu --parallel
+    - ctest --test-dir build-hal-cpu --output-on-failure --output-junit junit.xml
+      --timeout 600 --no-tests=error
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - junit.xml
+      - hal-diagnostics.txt
+      - build-hal-cpu/Testing/Temporary/LastTest.log
+      - build-hal-cpu/Testing/Temporary/LastTestsFailed.log
+    reports:
+      junit: junit.xml
+  timeout: 90 minutes
+  interruptible: false
+  rules: *ci_rules
+
+test:hal:nvidia:
+  stage: test
+  # PLACEHOLDER: confirm the image tag (and pin its digest) when the HAL NVIDIA
+  # runner is provisioned. CUDA 12.x supports the A30 on the pinned driver set.
+  image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+  extends: .prepare-cuda
+  tags:
+    # TODO(operator): replace with the registered HAL NVIDIA runner tags.
+    - hal
+    - cuda
+    - nvidia
+  variables:
+    # Use the A30 allocated to the job, never every visible GPU.
+    CUDA_VISIBLE_DEVICES: "0"
+  script:
+    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+      || { echo "checked out $(git rev-parse HEAD), expected CI_COMMIT_SHA $CI_COMMIT_SHA"; exit 1; }
+    - |
+      {
+        echo '$ nvidia-smi -q'
+        nvidia-smi -q 2>&1 || echo '(nvidia-smi unavailable)'
+        echo '$ nvcc --version'
+        nvcc --version 2>&1 || echo '(nvcc unavailable)'
+        echo '$ cmake --version'
+        cmake --version 2>&1 || true
+        echo '$ lscpu'
+        lscpu 2>&1 || true
+      } > hal-diagnostics.txt
+    - env -u LD_LIBRARY_PATH -u CMAKE_PREFIX_PATH
+      cmake -S . -B build-hal-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release
+      -DGRAPH_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80
+    - env -u LD_LIBRARY_PATH -u CMAKE_PREFIX_PATH cmake --build build-hal-cuda --parallel
+    - CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-hal-cuda --output-on-failure
+      --output-junit junit.xml --timeout 900 --no-tests=error
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - junit.xml
+      - hal-diagnostics.txt
+      - build-hal-cuda/Testing/Temporary/LastTest.log
+      - build-hal-cuda/Testing/Temporary/LastTestsFailed.log
+    reports:
+      junit: junit.xml
+  timeout: 120 minutes
+  interruptible: false
+  rules: *ci_rules
