@@ -345,6 +345,9 @@ namespace
                     if(slots[i].meta.active != 0u)
                         held++;
                 results[7] = held;
+                // Diagnostic counters from the pool header.
+                results[8] = pool.casFailures();
+                results[9] = pool.metaChecks();
             }
         }
     };
@@ -437,7 +440,7 @@ namespace
     {
         auto device = makeTestDevice();
         using Pool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
-        auto const totalBytes = Pool::storageBytes + 8 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
+        auto const totalBytes = Pool::storageBytes + 10 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
 
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
@@ -462,7 +465,8 @@ namespace
             "cap=" << T_SlotCapacity << " warps=" << T_BlockCount << " acqPerWarp=" << T_AcquiresPerWarp
                    << " acqOk=" << results[0] << " acqFail=" << results[1] << " relFail=" << results[2]
                    << " doubleOut=" << results[3] << " nonMono=" << results[4] << " violations=" << results[5]
-                   << " freeCount=" << results[6] << " heldAtEnd=" << results[7]);
+                   << " freeCount=" << results[6] << " heldAtEnd=" << results[7]
+                   << " casFailures=" << results[8] << " metaChecks=" << results[9]);
         CHECK(results[0] == expectedAcq);
         CHECK(results[1] == 0u);
         CHECK(results[2] == 0u);

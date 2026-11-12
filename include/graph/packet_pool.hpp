@@ -501,6 +501,18 @@ namespace graph
             return header().violations;
         }
 
+        /** CAS failures during pop (diagnostic; zero in a correct run). */
+        [[nodiscard]] ALPAKA_FN_ACC constexpr std::uint64_t casFailures() const noexcept
+        {
+            return header().casFailures;
+        }
+
+        /** Number of pop attempts that passed the terminator/index check (diagnostic). */
+        [[nodiscard]] ALPAKA_FN_ACC constexpr std::uint64_t metaChecks() const noexcept
+        {
+            return header().metaChecks;
+        }
+
     private:
         /** Tag bit of the free-list head: distinguishes the terminator
          *  (tag 1, no index) from a real slot (tag 0). The free list never
