@@ -49,18 +49,29 @@
  *   load/store ordering.
  * - `graph::systemLoadAcquire`/`graph::systemStoreRelease` on the device and
  *   `graph::host::hostLoadAcquire`/`graph::host::hostStoreRelease` on the host.
- * - A release store alone publishes the preceding descriptor writes; no
- *   `__threadfence_system` is required. The extra acquire/release fences in the
- *   import path make the system scope of the one-way barrier explicit for the
- *   following plain descriptor reads / preceding descriptor reads.
+ * - A release store alone publishes the preceding descriptor writes; nothing in
+ *   this header depends on `__threadfence_system` for publication. The extra
+ *   acquire/release fences around each ordered counter pair are explicit
+ *   system-scope markers (design 5.2); they are redundant for publication and
+ *   are not a second barrier, so they must not be relied on as one.
  *
  * Threading:
- * - Exactly one host thread may call any mutating host method (`tryEnqueue`,
- *   `enqueueBlocking`, `closeInput`, `setCountersForTest`) at a time. Callers
- *   that share the ring must serialise their submissions before entering it.
+ * - Exactly one host thread may call a mutating host method that writes the
+ *   `published` counter (`tryEnqueue`, `enqueueBlocking`, `closeInput`,
+ *   `setCountersForTest`) at a time. Callers that share the ring must serialise
+ *   their submissions before entering it.
+ * - `requestStop()` is the one documented exception. It only release-stores the
+ *   `closed` flag, which no producer writes, so a supervising host thread may
+ *   call it while a producer is blocked inside `enqueueBlocking`. It is the
+ *   supported way to cancel a blocked producer. A graceful `closeInput()` is
+ *   *not* safe in that position: it publishes the ordered end marker through
+ *   `published`, so it needs both a free slot and exclusive producer ownership,
+ *   which a producer waiting for space does not grant.
  * - Exactly one device lane may call `pollAndImport`. Other workers coordinate
  *   through device-scope synchronisation on their own ready ring; they never
- *   touch this host-facing ring.
+ *   touch this host-facing ring. `pollAndImportHost` is the CPU-side twin and
+ *   follows the same single-consumer rule; it may run concurrently with the
+ *   producer.
  *
  * This header is header-only and dispatches on the accelerator API tag
  * (`alpaka::api::Cuda` / `alpaka::api::Host`). It contains no accelerator
@@ -79,12 +90,14 @@ namespace graph
     /** Status of a host submission. */
     enum class EnqueueStatus
     {
-        /// Every requested descriptor was accepted.
+        /// Everything requested was accepted and published.
         accepted,
         /// The ring had less free space than requested; `accepted` reports the
         /// prefix that was written. The ring remains open.
         ring_full,
-        /// The ring is closed; nothing was mutated.
+        /// The ring is closed; this call published nothing. `enqueueBlocking`
+        /// additionally reports in `accepted` a prefix it published before a
+        /// concurrent `requestStop()` became visible.
         closed,
         /// Invalid input or an internal counter/range violation; nothing was
         /// published. See `EnqueueResult::error`.
@@ -196,7 +209,9 @@ namespace graph
     /** Result of one importer poll.
      *
      * `imported` counts every descriptor staged, including the end marker.
-     * `jobCount` counts only non-control descriptors.
+     * `jobCount` counts only non-control descriptors. On `ImportStatus::error`
+     * both are zero and the staging contents are unspecified: nothing was
+     * acknowledged and `consumed` did not move.
      */
     struct ImportBatch
     {
@@ -471,9 +486,20 @@ namespace graph
              * system-scope references for the mapped allocation. This is also
              * the "host importer thread" path used by the CPU integration test;
              * it is not GPU evidence.
+             *
+             * The error contract matches `pollAndImport`: a rejection by
+             * @p resolver, a counter violation or an argument error returns
+             * `ImportStatus::error`, records the code in `importError` and
+             * leaves `consumed` unchanged. The ring is not poisoned, so a later
+             * poll with an accepting resolver imports the same descriptors
+             * again.
              */
-            ImportBatch pollAndImportHost(Descriptor* staging, std::uint32_t stagingCapacity, std::uint32_t maxBatch)
-                const
+            template<typename T_Resolver>
+            ImportBatch pollAndImportHost(
+                Descriptor* staging,
+                std::uint32_t stagingCapacity,
+                std::uint32_t maxBatch,
+                T_Resolver resolver) const
             {
                 ImportBatch batch{};
                 if(control == nullptr || slots == nullptr)
@@ -488,7 +514,7 @@ namespace graph
                 detail::hostCounterFenceAcquire(systemScope);
                 std::uint64_t const tail = detail::hostCounterLoadAcquire(systemScope, &control->consumed);
 
-                batch = importRange(head, tail, staging, stagingCapacity, maxBatch, AcceptAll{});
+                batch = importRange(head, tail, staging, stagingCapacity, maxBatch, resolver);
                 if(batch.status == ImportStatus::error)
                 {
                     detail::hostCounterStoreRelease(
@@ -506,12 +532,23 @@ namespace graph
                 {
                     batch.status = ImportStatus::error;
                     batch.error = IngressError::counter_overflow;
+                    detail::hostCounterStoreRelease(
+                        systemScope,
+                        &control->importError,
+                        static_cast<std::uint32_t>(batch.error));
                     return batch;
                 }
                 detail::hostCounterStoreRelease(systemScope, &control->totalImported, importedBefore + batch.imported);
                 detail::hostCounterFenceRelease(systemScope);
                 detail::hostCounterStoreRelease(systemScope, &control->consumed, tail + batch.imported);
                 return batch;
+            }
+
+            /** Host-side importer that accepts every descriptor. */
+            ImportBatch pollAndImportHost(Descriptor* staging, std::uint32_t stagingCapacity, std::uint32_t maxBatch)
+                const
+            {
+                return pollAndImportHost(staging, stagingCapacity, maxBatch, AcceptAll{});
             }
 
         private:
@@ -692,8 +729,16 @@ namespace graph
         /** Blocking convenience wrapper.
          *
          * Waits for free space until @p timeout elapses. Returns `ring_full`
-         * with the accepted prefix on timeout, or `closed` if the ring closes
-         * while waiting. A zero timeout is equivalent to `tryEnqueue`.
+         * with the accepted prefix on timeout, or `closed` when the ring is
+         * already closed or `requestStop()` is called while waiting; in that
+         * case `accepted` still reports the prefix published before the close
+         * became visible. A zero timeout is equivalent to `tryEnqueue`. An
+         * empty submission is forwarded to `tryEnqueue`, so an empty batch on a
+         * closed ring still reports `closed`.
+         *
+         * The wait is bounded by @p timeout plus one submission attempt. It
+         * yields between attempts and re-checks both the deadline and the close
+         * flag on every iteration, so it cannot spin forever.
          */
         EnqueueResult enqueueBlocking(
             std::span<Descriptor const> descriptors,
@@ -711,6 +756,10 @@ namespace graph
                 result.error = IngressError::counter_overflow;
                 return result;
             }
+            // Forward the empty case so the closed/error status is reported
+            // instead of a vacuous `accepted`.
+            if(descriptors.empty())
+                return tryEnqueue(descriptors);
 
             while(offset < descriptors.size())
             {
@@ -753,6 +802,11 @@ namespace graph
          * Once accepted, every later `tryEnqueue` returns `closed`. The marker
          * is visible to the importer only after all earlier descriptors, so the
          * device processes it last.
+         *
+         * It needs one free slot: on a full ring it reports `ring_full` and the
+         * input side stays open. Because it writes `published`, it must be
+         * serialised with the producer; use `requestStop()` to cancel a blocked
+         * producer instead.
          */
         EnqueueResult closeInput()
         {
@@ -777,6 +831,29 @@ namespace graph
             return result;
         }
 
+        /** Cancel the input side and terminate a blocked `enqueueBlocking`.
+         *
+         * Release-stores the close flag only. It publishes no descriptor and
+         * does not touch `published`, so a supervising host thread may call it
+         * while the producer is blocked inside `enqueueBlocking`: the producer
+         * stays the only writer of `published`. Every later submission and
+         * `closeInput()` then reports `closed`.
+         *
+         * This is not a graceful close. No ordered end-of-input marker is
+         * enqueued, so the importer simply sees no further descriptors;
+         * descriptors already published stay importable. Use `closeInput()`
+         * when the importer must observe the ordered end marker.
+         */
+        void requestStop() noexcept
+        {
+            if(m_view.control == nullptr)
+                return;
+            detail::hostCounterStoreRelease(
+                m_view.systemScopeHostAtomics != 0u,
+                &m_view.control->closed,
+                std::uint32_t{1u});
+        }
+
         bool isClosed() const
         {
             if(m_view.control == nullptr)
@@ -785,7 +862,15 @@ namespace graph
             return detail::hostCounterLoadAcquire(systemScope, &m_view.control->closed) != 0u;
         }
 
-        /** Debug counters plus the current modular positions. */
+        /** Debug counters plus the current modular positions.
+         *
+         * One call is not a consistent snapshot: the counters are loaded
+         * independently, so `occupancy` can be a mix of two moments while a
+         * producer or importer runs concurrently. Treat the values as
+         * diagnostics. `importError` is sticky: it keeps the last recorded
+         * importer error until `setCountersForTest` resets it, which is how the
+         * host observes an error after the fact.
+         */
         struct DebugCounters
         {
             std::uint64_t published{0u};
