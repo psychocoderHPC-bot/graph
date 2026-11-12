@@ -635,31 +635,44 @@ namespace graph
                 (void) pool_detail::atomicAddDevice(acc, &hdr->violations, std::uint64_t{1u});
                 return false;
             }
-            for(std::uint32_t attempt = 0u; attempt < (1u << 20u); ++attempt)
+            for(std::uint32_t attempt = 0u; attempt < maxPopAttempts; ++attempt)
             {
                 std::uint32_t const expected = *reinterpret_cast<std::uint32_t volatile*>(&hdr->freeListHead);
                 // Link this slot at the head: its next field points at the
-                // current head's index (or the terminator).
+                // current head's index (or the terminator). This must happen
+                // BEFORE the CAS: a concurrent popper reads the successor
+                // from the slot once the head points to it, so the successor
+                // must already be written.
                 slot->record.handle.index = headIsTerminator(expected) ? invalidSlotIndex : headIndex(expected);
                 slot->record.handle.generation = 0u;
                 slot->record.elementCount = 0u;
                 slot->record.schema = ElementSchema{};
-                // Clear active and bump the generation: a stale handle no
-                // longer matches, so a second release of the same handle is
-                // rejected by the generation check.
-                slot->meta.active = 0u;
-                slot->meta.generation += 1u;
-                // Release the slot's new free-list state before the head CAS.
+                // Release the record before the head CAS so the popper
+                // observes the new successor.
                 pool_detail::publishRelease(acc);
+                // CAS the head: this slot becomes the new head.
                 std::uint32_t const desired = encodeHead(handle.index, 0u);
                 std::uint32_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
                 if(result == expected)
                 {
+                    // CAS succeeded: commit the meta. Clear active and bump
+                    // the generation so a stale handle no longer matches.
+                    // The meta stores are after the CAS: if the CAS had
+                    // failed, the generation bump would have made the handle
+                    // stale without the slot being on the free list.
+                    slot->meta.active = 0u;
+                    slot->meta.generation += 1u;
+                    pool_detail::publishRelease(acc);
                     (void) pool_detail::atomicAddDevice(acc, &hdr->headVersion, std::uint32_t{1u});
                     (void) pool_detail::atomicAddDevice(acc, &hdr->freeCount, std::uint64_t{1u});
                     return true;
                 }
-                // CAS failed: retry with the new head.
+                // CAS failed: another warp moved the head. The record stores
+                // above (successor, elementCount, schema) are harmless: the
+                // slot is not on the free list (the CAS failed), so no
+                // popper reads them. The meta is untouched, so the handle
+                // is still valid for a retry.
+                (void) pool_detail::atomicAddDevice(acc, &hdr->casFailures, std::uint64_t{1u});
             }
             return false;
         }
