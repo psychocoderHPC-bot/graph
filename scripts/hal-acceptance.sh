@@ -58,6 +58,12 @@ Options:
                             (default: 900)
   --example-timeout SEC     Wall-clock timeout for one example run
                             (default: 300)
+  --configure-timeout SEC   Wall-clock timeout for one cmake configure
+                            (default: 1800)
+  --build-timeout SEC       Wall-clock timeout for one cmake build
+                            (default: 3600)
+  --lint-timeout SEC        Wall-clock timeout for one lint gate
+                            (default: 600)
   --particles N             Example particle count (default: 65536)
   --chunk-size Y            Example chunk size (default: 128)
   --seed S                  Example seed (default: 42)
@@ -137,6 +143,9 @@ jobs=""
 cpu_timeout=600
 cuda_timeout=900
 example_timeout=300
+configure_timeout=1800
+build_timeout=3600
+lint_timeout=600
 particles=65536
 chunk_size=128
 seed=42
@@ -229,6 +238,33 @@ while [ "$#" -gt 0 ]; do
             example_timeout=${1#*=}
             shift
             ;;
+        --configure-timeout)
+            need_arg "$@"
+            configure_timeout=$2
+            shift 2
+            ;;
+        --configure-timeout=*)
+            configure_timeout=${1#*=}
+            shift
+            ;;
+        --build-timeout)
+            need_arg "$@"
+            build_timeout=$2
+            shift 2
+            ;;
+        --build-timeout=*)
+            build_timeout=${1#*=}
+            shift
+            ;;
+        --lint-timeout)
+            need_arg "$@"
+            lint_timeout=$2
+            shift 2
+            ;;
+        --lint-timeout=*)
+            lint_timeout=${1#*=}
+            shift
+            ;;
         --particles)
             need_arg "$@"
             particles=$2
@@ -311,6 +347,9 @@ require_uint --cuda-arch "$cuda_arch"
 require_uint --cpu-timeout "$cpu_timeout"
 require_uint --cuda-timeout "$cuda_timeout"
 require_uint --example-timeout "$example_timeout"
+require_uint --configure-timeout "$configure_timeout"
+require_uint --build-timeout "$build_timeout"
+require_uint --lint-timeout "$lint_timeout"
 require_uint --particles "$particles"
 require_uint --chunk-size "$chunk_size"
 require_uint --seed "$seed"
@@ -318,6 +357,9 @@ require_uint --seed "$seed"
 [ "$cpu_timeout" -gt 0 ] || die "--cpu-timeout must be positive"
 [ "$cuda_timeout" -gt 0 ] || die "--cuda-timeout must be positive"
 [ "$example_timeout" -gt 0 ] || die "--example-timeout must be positive"
+[ "$configure_timeout" -gt 0 ] || die "--configure-timeout must be positive"
+[ "$build_timeout" -gt 0 ] || die "--build-timeout must be positive"
+[ "$lint_timeout" -gt 0 ] || die "--lint-timeout must be positive"
 [ "$chunk_size" -gt 0 ] || die "--chunk-size must be at least 1"
 
 if [ -z "$jobs" ]; then
@@ -332,6 +374,7 @@ require_uint --jobs "$jobs"
 # ----------------------------------------------------------- repository ---
 
 have git || die "git is required"
+have timeout || die "timeout(1) is required for the bounded configure, build, and lint gates"
 git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1 || die "$repo_root is not a git checkout"
 
 git_commit=$(git -C "$repo_root" rev-parse HEAD)
@@ -417,6 +460,9 @@ record build_jobs "$jobs"
 record cpu_timeout_s "$cpu_timeout"
 record cuda_timeout_s "$cuda_timeout"
 record example_timeout_s "$example_timeout"
+record configure_timeout_s "$configure_timeout"
+record build_timeout_s "$build_timeout"
+record lint_timeout_s "$lint_timeout"
 record example_particles "$particles"
 record example_chunk_size "$chunk_size"
 record example_seed "$seed"
@@ -558,9 +604,11 @@ configure_and_build()
     if [ -n "$catch2_dir" ]; then
         set -- "$@" -DFETCHCONTENT_SOURCE_DIR_CATCH2="$catch2_dir"
     fi
-    log_cmd "$@"
+    log_cmd timeout "$configure_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@"
 
-    if scrubbed "$@" >"$conf_log" 2>&1; then
+    if timeout "$configure_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@" >"$conf_log" 2>&1; then
         conf_rc=0
     else
         conf_rc=$?
@@ -572,8 +620,10 @@ configure_and_build()
     fi
 
     set -- cmake --build "$build" -j "$jobs"
-    log_cmd "$@"
-    if scrubbed "$@" >"$build_log" 2>&1; then
+    log_cmd timeout "$build_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@"
+    if timeout "$build_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@" >"$build_log" 2>&1; then
         build_rc=0
     else
         build_rc=$?
@@ -689,8 +739,11 @@ run_repo_gate()
     gate=$1
     script=$2
     log=$3
-    log_cmd "scripts/$script"
-    if scrubbed "$repo_root/scripts/$script" >"$log" 2>&1; then
+    log_cmd timeout "$lint_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH scripts/"$script"
+    if timeout "$lint_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
+        "$repo_root/scripts/$script" >"$log" 2>&1; then
         rc=0
     else
         rc=$?
