@@ -7,6 +7,7 @@
 
 #include <graph/detail/job.hpp>
 #include <graph/detail/packet.hpp>
+#include <graph/detail/stream_id.hpp>
 
 #include <array>
 #include <cstddef>
@@ -91,37 +92,6 @@ namespace graph
 
     static_assert(std::is_trivially_copyable_v<NodeId>);
     static_assert(std::is_standard_layout_v<NodeId>);
-
-    /** Strong identifier of a logical stream (a scheduled destination). */
-    struct StreamId
-    {
-        using ValueType = std::uint32_t;
-
-        static constexpr ValueType invalidValue = ~ValueType{0u};
-
-        ValueType value{invalidValue};
-
-        constexpr StreamId() noexcept = default;
-
-        constexpr explicit StreamId(ValueType id) noexcept : value(id)
-        {
-        }
-
-        static constexpr StreamId invalid() noexcept
-        {
-            return StreamId{};
-        }
-
-        constexpr bool isValid() const noexcept
-        {
-            return value != invalidValue;
-        }
-
-        friend constexpr bool operator==(StreamId const&, StreamId const&) = default;
-    };
-
-    static_assert(std::is_trivially_copyable_v<StreamId>);
-    static_assert(std::is_standard_layout_v<StreamId>);
 
     /** Classification of a graph build error. */
     enum class GraphErrorCode : std::uint32_t

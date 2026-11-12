@@ -7,6 +7,7 @@
 
 #include <graph/detail/concepts.hpp>
 #include <graph/detail/packet.hpp>
+#include <graph/detail/stream_id.hpp>
 #include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
 
@@ -87,41 +88,6 @@ namespace graph
 
     /** Sentinel index that names no physical chunk slot. */
     inline constexpr std::uint32_t invalidChunkSlot = ~std::uint32_t{0u};
-
-    /** Strong identifier of a destination stream.
-     *
-     * This is deliberately not a bin id: two graph stages may use the same
-     * numeric bin and still have distinct streams.
-     */
-    struct StreamId
-    {
-        using ValueType = std::uint32_t;
-
-        static constexpr ValueType invalidValue = ~ValueType{0u};
-
-        ValueType value{invalidValue};
-
-        constexpr StreamId() noexcept = default;
-
-        constexpr explicit StreamId(ValueType id) noexcept : value(id)
-        {
-        }
-
-        static constexpr StreamId invalid() noexcept
-        {
-            return StreamId{};
-        }
-
-        ALPAKA_FN_HOST_ACC constexpr bool isValid() const noexcept
-        {
-            return value != invalidValue;
-        }
-
-        friend constexpr bool operator==(StreamId const&, StreamId const&) = default;
-    };
-
-    static_assert(std::is_trivially_copyable_v<StreamId>);
-    static_assert(std::is_standard_layout_v<StreamId>);
 
     /** Description of one physical chunk slot in a `ChunkArena`.
      *
