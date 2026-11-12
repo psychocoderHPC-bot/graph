@@ -11,11 +11,10 @@ Numerics: [`numerics.md`](numerics.md). Gaps:
 ## Host and device split
 
 - The pool host object owns the queue, the mapped ingress ring, the packet
-  pools, the `CopyQueue`, and the operation table. The `Pool` class is pending;
-  it does not exist at this commit.
-- One persistent kernel per pool lifetime, resident while idle, stopping only
-  after an ordered close and a complete drain. The pool kernel is pending; the
-  implemented parts are the rendezvous kernel and the launch-geometry code.
+  pools, the `CopyQueue`, and the operation table (`include/graph/pool.hpp`).
+- One persistent kernel per pool lifetime (`detail::PoolKernel` in
+  `include/graph/detail/scheduler.hpp`), resident while idle, stopping only
+  after an ordered close and a complete drain.
 - One hardware warp is one worker; bring-up is one warp per block. All lanes
   execute the same indirect device-function call on one packet.
 - Single resident wave: the grid is sized to the resident capacity and
@@ -42,14 +41,16 @@ Numerics: [`numerics.md`](numerics.md). Gaps:
 | `include/graph/detail/views.hpp` | Typed, bounds-masked packet views. |
 | `include/graph/detail/concepts.hpp` | Element-schema concepts. |
 | `include/graph/detail/config.hpp` | Version, feature, register fallback. |
+| `include/graph/detail/stream_id.hpp` | Strong `StreamId` type and stream-endpoint helpers. |
 | `include/graph/packet_pool.hpp` | Packet slot pool, reuse generation. |
 | `include/graph/graph_model.hpp` | Host-side graph builder. |
 | `include/graph/particle_feedback_graph.hpp` | Example graph description. |
 | `include/graph/rng.hpp` | Counter-based integer RNG. |
 | `include/graph/particle_functors.hpp` | Example functors, pure cores. |
 | `include/graph/histogram.hpp` | Host-side final-weight histogram. |
-The host `Pool` object, the persistent pool kernel, and the scheduler are
-pending; none exists as a header at this commit.
+The host `Pool` object (`include/graph/pool.hpp`), the persistent pool kernel,
+and the scheduler (`include/graph/detail/scheduler.hpp`) are implemented on the
+`warp-pool` branch.
 
 ## Data path
 
@@ -112,8 +113,9 @@ using OperationFn = void (*)(T_Acc const&, JobDescriptor const&, PacketAccessor 
   stores an `OperationFn` pointer in a `__device__` array, reloads it, and
   calls it from device code.
 - The pool kernel binds host-registered ids to device addresses in a startup
-  phase and then rendezvous. That rendezvous with deadline is not in the tree
-  yet; pending. The `RendezvousKernel` is the geometry co-residency test.
+  phase and then rendezvous (`startupRendezvous` in
+  `include/graph/detail/scheduler.hpp`). The `RendezvousKernel` remains the
+  geometry co-residency test.
 
 ## Launch geometry
 
@@ -127,15 +129,52 @@ workers; the default policy is one warp per block. `validateSingleWave()`
 re-derives the resident block count and fails a grid larger than one wave.
 The per-thread register count of the persistent kernel cannot be queried
 without a kernel handle, so the build captures it from the compiler
-(`-Xptxas -v`, `cmake/GraphRegisters.cmake`) as `GRAPH_KERNEL_REGISTERS`.
-Without a capture, `config.hpp` falls back to 128 registers per thread, the
-highest A30 occupancy step measured in P1-PROTOCOL-PROBES.
-Measured A30 result (`docs/hal-acceptance.md`): 1792 blocks of 32 threads, 56
-SMs, 32 residents per SM, 20 registers per thread captured, 1792 of 1792
-workers arriving at the rendezvous, `launchCount` 1, `singleWave` 1. That
-capture compiled `RendezvousKernel`, not the pool kernel. The pool kernel's
-register capture is a separate pending item; until it exists the grid may be
-conservative, or over-optimistic if the pool kernel uses more registers.
+(`-Xptxas -v`, `cmake/GraphRegisters.cmake`) as `GRAPH_KERNEL_REGISTERS`. The
+probe `cmake/GraphRegisterProbe.cu` instantiates `detail::PoolKernel` (the
+pool's own persistent entry point) as well as `RendezvousKernel` and reports
+the maximum, so the number comes from the real entry point. Without a capture,
+`config.hpp` falls back to 128 registers per thread, the highest A30 occupancy
+step measured in P1-PROTOCOL-PROBES.
+
+Measured A30 result on the `warp-pool` branch: `PoolKernel<NullBinder>` compiles
+to 48 registers/thread. A user binder is compiled into the same kernel and
+raises the count: the test toy binder compiles to 90 registers/thread. At 48
+the measured rule allows the 32-blocks/SM cap and therefore 1792 workers; at 90
+it allows 20 blocks/SM and 1120 blocks. Because the capture cannot see the
+binder, `startPool()` keeps the 128-register floor on top of the captured value
+(896 blocks, 16 residents/SM), and a caller that has measured its binder passes
+`PoolConfig::registerHint`. The rendezvous record in `docs/hal-acceptance.md`
+measured `RendezvousKernel` (20 registers), not the pool kernel.
+
+## Pool guarantees and their gates
+
+The persistent pool makes the following claims. Each names the test that gates
+it; `tests/integration/test_pool_core.cpp` runs the host backend and
+`tests/integration/test_pool_gpu.cpp` runs one real CUDA launch.
+
+- **Exactly-once sink writes.** Every accepted item reaches the sink exactly
+  once; the sink increments `sinkVisits` and the test requires `sinkVisits == 1`
+  for every id and zero mismatches. Gate: `checkResults` in
+  `test_pool_gpu.cpp` and the toy-worklist checks in `test_pool_core.cpp`.
+- **Distinct worker ids.** The kernel records the participating block indices
+  in a worker bitmap; the drain test requires `distinctWorkers >= 2`, so more
+  than one warp consumed work. Gate: `distinctWorkers` in the drain snapshot.
+- **Launch once.** One kernel serves every batch of a lifetime;
+  `launchCount == 1` after drain. Gate: the drain and idle-resume cases.
+- **Idle then resume.** The kernel stays resident while idle and serves a late
+  submission without a relaunch; the resume case measures the enqueue-to-retire
+  latency and reports it. Gate: the idle-resume case.
+- **Pressure.** A deliberately small pool (`maxReadyInFlight = 2`,
+  `maxImportBatch = 4`) consumes a full-capacity batch without deadlock and ends
+  in an ordered drain. Gate: the pressure case.
+- **Abort.** A host abort stops a pool with pending work and reports
+  `stoppedByAbort` with the `aborted` error bit. Gate: the abort cases in
+  `test_pool_core.cpp`.
+
+Verification status: the host-backend cases pass. The CUDA repeat of this branch
+does not pass; see `docs/known-limitations.md`, which records the open defect and
+the evidence that it is a pool free-list visibility problem, not the packet
+handle.
 
 ## Co-residency
 

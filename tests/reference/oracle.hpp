@@ -63,8 +63,9 @@ namespace rng_oracle
     // of c; the outer splitmix64(c) -> h maps c to a uniform 64-bit output. The
     // composition is a practical bijection on the key tuples that occur (verified:
     // 200k random tuples -> 0 collisions), and the flag1 sequence has no period
-    // below 2^20 (verified empirically for seeds 42 and 7, ids 0..2, purposes
-    // FILTER and DECISION_A).
+    // below 2^20 (verified empirically for seeds 42, 7, and 0; ids 1..3;
+    // purposes FILTER and DECISION_A). tests/unit/test_rng.cpp guards that
+    // claim with a 2^20 search over 2^21 draws.
     //
     // The (x + 1) shift on id, visit, and purpose keeps the field contributions
     // from collapsing onto zero when the field is 0; without it, the raw key for

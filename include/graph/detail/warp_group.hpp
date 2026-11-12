@@ -83,8 +83,13 @@ namespace graph
                     return value;
                 if constexpr(std::is_integral_v<T> && sizeof(T) == 8u)
                 {
-                    T const lo = broadcast(std::uint32_t{static_cast<std::uint32_t>(value)}, srcLane, width);
-                    T const hi = broadcast(std::uint32_t{static_cast<std::uint32_t>(value >> 32u)}, srcLane, width);
+                    // Shuffle the two halves directly. Calling the three-argument
+                    // overload here would select the word-wise overload with
+                    // T = std::uint32_t, which calls itself for a four-byte word
+                    // (unbounded recursion, device stack overflow).
+                    T const lo = alpaka::onAcc::warp::shfl(*m_acc, static_cast<std::uint32_t>(value), srcLane, width);
+                    T const hi
+                        = alpaka::onAcc::warp::shfl(*m_acc, static_cast<std::uint32_t>(value >> 32u), srcLane, width);
                     return static_cast<T>(lo | (static_cast<T>(hi) << 32u));
                 }
                 else
@@ -96,7 +101,7 @@ namespace graph
 
         /** Warp-uniform broadcast of a trivially copyable multi-field value.
          *
-         * The value is exchanged word by word through the scalar broadcast, so
+         * The value is exchanged word by word through the 32-bit shuffle, so
          * a caller never has to split a struct by hand. Each word moves as a
          * 32-bit `shfl.b32` (64-bit words split into two halves), which is the
          * only form that is portable across backends; a native 64-bit shuffle
@@ -122,9 +127,15 @@ namespace graph
                     return value;
                 if constexpr(sizeof(T) <= 4u)
                 {
-                    return broadcast(static_cast<std::uint32_t>(*reinterpret_cast<std::uint32_t const*>(&value)),
-                                     srcLane,
-                                     actual);
+                    // A four-byte word is the scalar shuffle case. This must not
+                    // call the three-argument overload again: for T =
+                    // std::uint32_t that overload is this function, so the call
+                    // would recurse without a base case.
+                    return alpaka::onAcc::warp::shfl(
+                        *m_acc,
+                        static_cast<std::uint32_t>(*reinterpret_cast<std::uint32_t const*>(&value)),
+                        srcLane,
+                        actual);
                 }
                 else
                 {
@@ -133,7 +144,7 @@ namespace graph
                     auto const* in = reinterpret_cast<std::uint32_t const*>(&value);
                     auto* words = reinterpret_cast<std::uint32_t*>(&out);
                     for(std::uint32_t i = 0u; i < wordCount; ++i)
-                        words[i] = broadcast(in[i], srcLane, actual);
+                        words[i] = alpaka::onAcc::warp::shfl(*m_acc, in[i], srcLane, actual);
                     return out;
                 }
             }

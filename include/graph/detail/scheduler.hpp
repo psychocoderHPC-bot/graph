@@ -259,8 +259,9 @@ namespace graph
          * deterministic for the warp instead of a lane-by-lane data race.
          */
         template<typename T_Acc>
-        ALPAKA_FN_ACC inline bool packetHandleValid(SchedulerRuntime<T_Acc>& runtime, PacketHandle const& handle)
-            noexcept
+        ALPAKA_FN_ACC inline bool packetHandleValid(
+            SchedulerRuntime<T_Acc>& runtime,
+            PacketHandle const& handle) noexcept
         {
             if(handle.index >= static_cast<std::uint32_t>(poolPacketSlotCapacity))
             {

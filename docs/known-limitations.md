@@ -5,13 +5,27 @@ SPDX-License-Identifier: MPL-2.0
 # Known limitations
 Engineering facts about the current tree, each with its evidence and the gate that would close it.
 
-## The persistent kernel's register capture is pending
-`-Xptxas -v` captures the per-thread register count in the translation unit that instantiates the
-kernel (`cmake/GraphRegisters.cmake`), but the probe `cmake/GraphRegisterProbe.cu` instantiates
-`RendezvousKernel`, not the pool kernel. Until the pool capture exists, launch geometry uses either
-the rendezvous capture (20 registers per thread, measured on the A30 in `docs/hal-acceptance.md`) or
-the 128-register fallback, so the grid may be conservative, or over-optimistic if the pool kernel
-uses more registers. `test_residency` measures the rendezvous kernel, not the pool kernel.
+## The register capture cannot see a user binder
+`cmake/GraphRegisterProbe.cu` now instantiates the pool's own persistent entry point
+(`detail::PoolKernel`) as well as `RendezvousKernel`, and `-Xptxas -v` reports the maximum. On the
+A30 `PoolKernel<NullBinder>` compiles to 48 registers/thread (32 blocks/SM, the 1792-worker wave).
+The binder is user code compiled into the same kernel: the test toy binder compiles to 90
+registers/thread (20 blocks/SM, 1120 blocks). The capture therefore cannot bound the wave for an
+arbitrary binder, so `startPool()` keeps the 128-register floor on top of the captured value
+(896 blocks) unless `PoolConfig::registerHint` names a measured binder value. The open item is a
+capture that includes a representative binder, or a per-instantiation occupancy check.
+
+## CUDA pool repeat fails on the packet-pool free list
+The CUDA `-R pool` repeat fails on the branch. `test_pool_gpu.cpp` aborts with
+`errorWord 0x240` (aborted plus internal scheduler state) when `packetHandleValid` drops a job: the
+slot record still holds its free-list value (generation 0, index = next free slot) while the ready
+entry carries the acquired generation. The pool-visible evidence is a free-list head that does not
+advance (the same slot index is handed out twice, generation 1 then 2) and a ready-ring
+`pushCounter - claimCounter` that underflows. This is a cross-warp visibility problem in the
+packet-pool header, not the packet-handle defect: the successor path now carries the descriptor's
+handle correctly. `test_pool_probes.cpp` finds mismatches only on the ring and pool headers, not in
+the broadcast of the descriptor. The defect is not fixed on this branch and the CUDA pool cases are
+therefore not a passing gate.
 
 ## Multi-warp-per-block is refused by design
 `WarpBarrier::barrier()` maps to a block-wide barrier only when the block holds exactly one warp.
@@ -59,6 +73,7 @@ The compute target reports `sharing=unknown`. The overlap and arrival timings in
 evidence, not benchmarks. A benchmark run requires an `exclusive` system.
 
 ## Acceptance gates still pending at this commit
+This section is the record for `52be5c72`; the current branch status is in the two sections above.
 `docs/hal-acceptance.md` covers `52be5c72`; the CPU and CUDA CTest suites pass there (119/119 and
 127/127). The following gates are not claimed:
 - The particle-feedback example and its histogram. The target does not exist;

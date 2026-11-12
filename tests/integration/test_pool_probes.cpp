@@ -131,8 +131,11 @@ namespace
     struct BroadcastDescriptorKernel
     {
         template<typename T_Acc>
-        ALPAKA_FN_ACC void operator()(T_Acc const& acc, std::uint32_t laneCount, DescriptorProbe const& source,
-                                      DescriptorProbe* received) const
+        ALPAKA_FN_ACC void operator()(
+            T_Acc const& acc,
+            std::uint32_t laneCount,
+            DescriptorProbe const& source,
+            DescriptorProbe* received) const
         {
             broadcastDescriptorProbeBody(acc, laneCount, source, received);
         }
@@ -159,8 +162,8 @@ namespace
         if(warp.isLeader())
         {
             auto* slot = reinterpret_cast<Ring::RingSlot*>(
-                static_cast<char*>(ringStorage) + Ring::headerBytes + static_cast<std::size_t>(entryIndex)
-                    * Ring::slotBytes);
+                static_cast<char*>(ringStorage) + Ring::headerBytes
+                + static_cast<std::size_t>(entryIndex) * Ring::slotBytes);
             std::uint64_t const stamp = static_cast<std::uint64_t>(entryIndex);
             std::memcpy(
                 &slot->entry,
@@ -185,9 +188,13 @@ namespace
     struct RingClaimKernel
     {
         template<typename T_Acc>
-        ALPAKA_FN_ACC void
-        operator()(T_Acc const& acc, std::uint32_t laneCount, void* ringStorage, std::uint32_t entryIndex,
-                   DescriptorProbe const& expected, DescriptorProbe* reported) const
+        ALPAKA_FN_ACC void operator()(
+            T_Acc const& acc,
+            std::uint32_t laneCount,
+            void* ringStorage,
+            std::uint32_t entryIndex,
+            DescriptorProbe const& expected,
+            DescriptorProbe* reported) const
         {
             ringClaimProbeBody(acc, laneCount, ringStorage, entryIndex, expected, reported);
         }
@@ -222,8 +229,11 @@ namespace
     struct PoolAcquireKernel
     {
         template<typename T_Acc>
-        ALPAKA_FN_ACC void
-        operator()(T_Acc const& acc, std::uint32_t laneCount, void* poolStorage, graph::PacketHandle* reported) const
+        ALPAKA_FN_ACC void operator()(
+            T_Acc const& acc,
+            std::uint32_t laneCount,
+            void* poolStorage,
+            graph::PacketHandle* reported) const
         {
             poolAcquireProbeBody(acc, laneCount, poolStorage, reported);
         }
@@ -246,7 +256,8 @@ namespace
         auto buffer = alpaka::onHost::alloc<std::uint32_t>(device, 1u);
         auto queue = const_cast<std::remove_cvref_t<T_Device>&>(device).makeQueue();
         queue.enqueue(
-            alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor}, WidthKernel{},
+            alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor},
+            WidthKernel{},
             alpaka::onHost::data(buffer));
         alpaka::onHost::wait(queue);
         auto host = alpaka::onHost::allocHost<std::uint32_t>(1u);
@@ -266,12 +277,10 @@ namespace
         {
             auto const& value = received[lane];
             bool const ok
-                = value.op == expected.op && value.kind == expected.kind
-                  && value.packetIndex == expected.packetIndex
-                  && value.packetGeneration == expected.packetGeneration
-                  && value.inputPort == expected.inputPort && value.outputPort == expected.outputPort
-                  && value.outputPortCount == expected.outputPortCount && value.firstId == expected.firstId
-                  && value.count == expected.count && value.seed == expected.seed
+                = value.op == expected.op && value.kind == expected.kind && value.packetIndex == expected.packetIndex
+                  && value.packetGeneration == expected.packetGeneration && value.inputPort == expected.inputPort
+                  && value.outputPort == expected.outputPort && value.outputPortCount == expected.outputPortCount
+                  && value.firstId == expected.firstId && value.count == expected.count && value.seed == expected.seed
                   && value.sequenceNumber == expected.sequenceNumber;
             if(!ok)
             {
@@ -312,17 +321,17 @@ namespace
     DescriptorProbe makeExpected()
     {
         DescriptorProbe expected{};
-        expected.op = 0x00c0ffeeu;
+        expected.op = 0x00c0'ffeeu;
         expected.kind = 0u;
-        expected.packetIndex = 0x0badf00du;
+        expected.packetIndex = 0x0bad'f00du;
         expected.packetGeneration = 7u;
         expected.inputPort = 3u;
         expected.outputPort = 1u;
         expected.outputPortCount = 2u;
         expected.firstId = 0x1122'3344'5566'7788ull;
-        expected.count = 987654321ull;
+        expected.count = 987'654'321ull;
         expected.seed = 0xfedc'ba98'7654'3210ull;
-        expected.sequenceNumber = 4242424242ull;
+        expected.sequenceNumber = 4'242'424'242ull;
         return expected;
     }
 } // namespace
@@ -345,8 +354,11 @@ TEST_CASE("probe 1: warp broadcast of the JobDescriptor field set", "[graph][poo
     alpaka::onHost::memcpy(queue, receivedDevice, hostReceived);
 
     queue.enqueue(
-        alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor}, BroadcastDescriptorKernel{},
-        laneCount, expected, alpaka::onHost::data(receivedDevice));
+        alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor},
+        BroadcastDescriptorKernel{},
+        laneCount,
+        expected,
+        alpaka::onHost::data(receivedDevice));
     alpaka::onHost::wait(queue);
 
     alpaka::onHost::memcpy(queue, hostReceived, receivedDevice);
@@ -376,8 +388,13 @@ TEST_CASE("probe 2: ready-ring claim and broadcast of the entry", "[graph][pool]
     alpaka::onHost::memcpy(queue, reportedDevice, hostReported);
 
     queue.enqueue(
-        alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor}, RingClaimKernel{}, laneCount,
-        alpaka::onHost::data(ringStorage), 5u, expected, alpaka::onHost::data(reportedDevice));
+        alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor},
+        RingClaimKernel{},
+        laneCount,
+        alpaka::onHost::data(ringStorage),
+        5u,
+        expected,
+        alpaka::onHost::data(reportedDevice));
     alpaka::onHost::wait(queue);
 
     alpaka::onHost::memcpy(queue, hostReported, reportedDevice);
@@ -404,8 +421,11 @@ TEST_CASE("probe 3: packet-pool acquire broadcasts the handle", "[graph][pool][p
     alpaka::onHost::memcpy(queue, reportedDevice, hostReported);
 
     queue.enqueue(
-        alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor}, PoolAcquireKernel{}, laneCount,
-        alpaka::onHost::data(poolStorage), alpaka::onHost::data(reportedDevice));
+        alpaka::onHost::ThreadSpec{std::uint32_t{1u}, std::uint32_t{32u}, executor},
+        PoolAcquireKernel{},
+        laneCount,
+        alpaka::onHost::data(poolStorage),
+        alpaka::onHost::data(reportedDevice));
     alpaka::onHost::wait(queue);
 
     alpaka::onHost::memcpy(queue, hostReported, reportedDevice);

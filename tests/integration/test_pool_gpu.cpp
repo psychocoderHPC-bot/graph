@@ -294,7 +294,7 @@ namespace
             "[pool-gpu] %s geometry blocks=%u threadsPerBlock=%u warpsPerBlock=%u workers=%u smCount=%u "
             "residentsPerSm=%u launchCount=%llu distinctWorkers=%llu accepted=%llu imported=%llu completed=%llu "
             "publications=%llu pendingSources=%llu outstanding=%llu queued=%llu active=%llu errorWord=0x%x "
-            "stopReason=%u\n",
+            "stopReason=%u readyViolations=%llu stopStage=%u\n",
             name,
             static_cast<unsigned>(geometry.blocks),
             static_cast<unsigned>(geometry.threadsPerBlock),
@@ -313,7 +313,9 @@ namespace
             static_cast<unsigned long long>(result.counters.queued),
             static_cast<unsigned long long>(result.counters.active),
             result.counters.errorWord,
-            result.counters.stopReason);
+            result.counters.stopReason,
+            static_cast<unsigned long long>(result.counters.readyViolations),
+            static_cast<unsigned>(result.counters.debugStopStage));
         std::fflush(stdout);
     }
 } // namespace
