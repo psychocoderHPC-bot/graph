@@ -163,8 +163,7 @@ namespace
                                 *outStatus = 0x0cc0'1001u;
                             return;
                         }
-                        auto const value = static_cast<T>(
-                            mix64(static_cast<std::uint64_t>(it) * 131u + lane));
+                        auto const value = static_cast<T>(mix64(static_cast<std::uint64_t>(it) * 131u + lane));
                         *pointer = value;
                         hazard[static_cast<std::size_t>(it) * capacity + lane * hazardStride] = value;
                     }
@@ -195,8 +194,7 @@ namespace
                 if(warp.isLeader())
                 {
                     std::uint32_t guard = 0u;
-                    while(alpaka::onAcc::atomicAdd(acc, arrival, std::uint32_t{0u}, alpaka::onAcc::scope::device)
-                               == 0u
+                    while(alpaka::onAcc::atomicAdd(acc, arrival, std::uint32_t{0u}, alpaka::onAcc::scope::device) == 0u
                           && guard++ < pollDeadline)
                     {
                         // bounded poll
@@ -227,8 +225,7 @@ namespace
                         auto const rank = base + group.rank;
                         if(active)
                         {
-                            auto const expected
-                                = static_cast<T>(mix64(static_cast<std::uint64_t>(it) * 131u + rank));
+                            auto const expected = static_cast<T>(mix64(static_cast<std::uint64_t>(it) * 131u + rank));
                             auto const chunkActual
                                 = storage[static_cast<std::size_t>(published.slot) * capacity + rank];
                             auto const hazardActual
@@ -267,18 +264,16 @@ namespace
         using StreamAlloc = decltype(alpaka::onHost::allocLike(
             std::declval<T_Device&>(),
             std::declval<std::vector<graph::AssemblyStream<T>>>()));
-        using StorageAlloc = decltype(alpaka::onHost::allocLike(
-            std::declval<T_Device&>(),
-            std::declval<std::vector<T>>()));
+        using StorageAlloc
+            = decltype(alpaka::onHost::allocLike(std::declval<T_Device&>(), std::declval<std::vector<T>>()));
         using SlotAlloc = decltype(alpaka::onHost::allocLike(
             std::declval<T_Device&>(),
             std::declval<std::vector<graph::ChunkSlot<T>>>()));
         using WordAlloc = decltype(alpaka::onHost::allocLike(
             std::declval<T_Device&>(),
             std::declval<std::vector<std::uint32_t>>()));
-        using HazardAlloc = decltype(alpaka::onHost::allocLike(
-            std::declval<T_Device&>(),
-            std::declval<std::vector<T>>()));
+        using HazardAlloc
+            = decltype(alpaka::onHost::allocLike(std::declval<T_Device&>(), std::declval<std::vector<T>>()));
 
         std::size_t rounds{0u};
         StreamAlloc streamAlloc;
@@ -380,10 +375,7 @@ namespace
 
     /** One launch: `rounds` published chunks, reader verifies all of them. */
     template<typename T, typename T_Device, typename T_Queue>
-    HazardOutcome runHazard(
-        T_Queue& queue,
-        HazardBuffers<T, T_Device, T_Queue>& buffers,
-        std::uint32_t rounds)
+    HazardOutcome runHazard(T_Queue& queue, HazardBuffers<T, T_Device, T_Queue>& buffers, std::uint32_t rounds)
     {
         auto const slotCount = rounds + 2u;
         // Fresh stream state: the writer starts from two empty chunks. The
@@ -392,10 +384,8 @@ namespace
         buffers.streamHost[0] = graph::AssemblyStream<T>{};
         buffers.streamHost[0].id = graph::StreamId{1u};
         buffers.streamHost[0].capacity = capacity;
-        buffers.streamHost[0].first
-            = graph::ChunkSlot<T>{0u, capacity, 0u, graph::PacketHandle{0u, 1u}};
-        buffers.streamHost[0].second
-            = graph::ChunkSlot<T>{1u, capacity, 0u, graph::PacketHandle{1u, 1u}};
+        buffers.streamHost[0].first = graph::ChunkSlot<T>{0u, capacity, 0u, graph::PacketHandle{0u, 1u}};
+        buffers.streamHost[0].second = graph::ChunkSlot<T>{1u, capacity, 0u, graph::PacketHandle{1u, 1u}};
         buffers.streamHost[0].version = 1u;
         alpaka::onHost::memcpy(queue, buffers.streamAlloc, buffers.streamHost);
         // Reset the arrival word, output words and publication descriptors.
@@ -470,8 +460,9 @@ TEST_CASE("chunk_assembly publication ordering is enforced by a real barrier", "
     {
         auto const result = runHazard<Elem, decltype(device), decltype(queue)>(queue, buffers, rounds);
 
-        INFO("launch=" << launch << " rounds=" << rounds << " status=" << result.status
-                       << " stale=" << result.stale << " deadline=" << result.deadline);
+        INFO(
+            "launch=" << launch << " rounds=" << rounds << " status=" << result.status << " stale=" << result.stale
+                      << " deadline=" << result.deadline);
         CHECK(result.deadline == 0u);
         REQUIRE(result.status == static_cast<std::uint32_t>(graph::AppendStatus::Ok));
         // Zero stale observations: with a real WarpBarrier no lane's store
