@@ -15,8 +15,22 @@ ordered close, and reports per-particle results. A particle-feedback example
 exercises a graph with a feedback cycle and prints an exact final-weight
 histogram. The project validates on a CPU backend and on an NVIDIA GPU.
 
-Status: **scaffolding**. The build, library sources, tests, and the example are
-not implemented yet; see `docs/design.md`.
+## Status
+
+Implemented and green at this commit (HAL acceptance record:
+`docs/hal-acceptance.md`): the build, the library sources, the unit and
+integration tests, and the hardware gates. The CPU and CUDA CTest suites pass
+(119/119 and 127/127), and the CUDA suite covers the residency rendezvous, the
+copy-queue overlap, the chunk-assembly publication guard, the ready-ring
+cross-warp visibility, and the particle-gpu kernel comparison. Format and REUSE
+pass.
+
+Pending at this commit: the host `Pool` object and the persistent pool kernel
+that combine ingestion, claim, dispatch, and drain into one launch; the
+particle-feedback example target (`examples/particle_feedback/CMakeLists.txt`
+adds no target, so both example gates are `NOT-BUILT`); the end-to-end
+particle pipeline on the pool; and the GitLab CI runners. Details:
+`docs/known-limitations.md`.
 
 ## Pinned dependency
 
@@ -32,17 +46,33 @@ development.
 
 | Path | Purpose |
 | --- | --- |
-| `include/graph/` | Pool, packet schemas, queues, and backend adapters |
-| `examples/particle_feedback/` | Portable example, functors, and example graph |
+| `include/graph/` | Library headers: rings, pool, chunk assembly, RNG, functors, model, ABI |
+| `include/graph/detail/` | Backend adapters, launch geometry, rendezvous, warp primitives, copy queue |
+| `examples/particle_feedback/` | Example graph description, functors, and CLI (example target pending) |
 | `tests/unit/` | Focused Catch2 cases |
-| `tests/integration/` | Worker pool and end-to-end pipeline tests |
-| `docs/` | Design summary and later build/validation records |
+| `tests/integration/` | Pool, pipeline, and hardware integration tests |
+| `tests/reference/` | Scalar oracle and the acceptance test vectors |
+| `probes/` | CUDA device-ABI and warp-barrier probes |
+| `cmake/` | Build modules, options, and register capture |
+| `docs/` | Design, architecture, numerics, limitations, build, CI, and acceptance records |
 | `scripts/` | Local helper scripts |
 | `LICENSES/` | Full license texts |
 
 ## Build and test
 
-Not available yet. The scaffolding commit contains no CMake project.
+Quickstart for the CPU and CUDA configurations is below. The full local
+validation that matches CI, the pinned tool versions, the environment scrubbing
+on `hal`, and the JUnit report commands are in `docs/build.md`.
+
+### Documentation
+
+- `docs/design.md`: design summary and index
+- `docs/architecture.md`: module map, data path, ordering rules, launch geometry
+- `docs/numerics.md`: exact RNG construction and particle semantics
+- `docs/known-limitations.md`: current engineering gaps
+- `docs/build.md`: build and test commands
+- `docs/ci.md`: CI pipeline status
+- `docs/hal-acceptance.md`: HAL hardware acceptance record
 
 ## License
 
