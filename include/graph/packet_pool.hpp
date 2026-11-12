@@ -39,6 +39,36 @@
  * completes; releasing earlier is a use-after-release that the generation
  * check detects in test builds.
  *
+ * # Cross-warp acquisition protocol
+ *
+ * Every mutable free-list field is a device-scope atomic word. The free list
+ * is a singly linked stack of slots; the `next` pointer of a free slot lives in
+ * the slot's own free-list field, and the head is a tagged word.
+ *
+ * - `freeListHead` packs a 31-bit slot index with a 1-bit tag. A push (release)
+ *   CAS-exchanges `index | (tag << 31)` into the head; a pop (acquire) reads
+ *   the head, walks the slot's `next`, and CAS-exchanges the successor into the
+ *   head. The tag distinguishes `invalidSlotIndex` (the terminator) from a
+ *   real slot, so a pop never hands out the terminator and the ABA window is
+ *   closed by the tag itself: a slot can only reappear at the head through a
+ *   push that also advances the tag, and a stale pop's CAS fails against it.
+ * - `freeCount` is a device-scope atomic 64-bit counter for capacity checks;
+ *   `violations` is a device-scope atomic 64-bit counter for test hooks.
+ * - Slot bookkeeping (`generation`, `active`) is written only by the winner of
+ *   the head CAS, so no two warps ever update the same slot's meta concurrently.
+ *
+ * The winner publishes the slot's record with a device-scope release fence
+ * before the head CAS that makes the slot visible, and every acquire that
+ * observes the new head performs a matching acquire against the head read.
+ * The generation is advanced exactly once per hand-out (in the winning CAS
+ * path), so a slot's generation is monotonic and each issued handle is
+ * distinct.
+ *
+ * `acquire()` and `release()` are warp-uniform: every active lane of the
+ * calling warp calls the same method with the same arguments, and only the
+ * lane selected by `WarpGroup::isLeader()` performs the atomic work. The
+ * result is broadcast through warp shuffles.
+ *
  * # Capacity budget (spec 6)
  *
  * The pool is sized by the documented formula `requiredSlots(P, B, W, R, S)`:
@@ -83,7 +113,7 @@ namespace graph
     /** One slot's bookkeeping, kept alongside the pool's slot array.
      *
      * `generation` starts at zero and increments on every reuse (that is, on
-     * every successful `release()`), so a handle whose generation does not
+     * every successful `acquire()`), so a handle whose generation does not
      * match the slot's current generation names a slot that has been reused.
      * The pool records an ownership violation for such a mismatch (see
      * `PacketPool::ownershipViolations()`).
@@ -91,6 +121,10 @@ namespace graph
      * `active` is set while a slot is held and cleared on release; a release
      * on a slot that is not active is a double-release and records a
      * violation.
+     *
+     * Both fields are written only by the winner of the free-list head CAS,
+     * so no two warps update the same slot concurrently; the head CAS is the
+     * synchronization that protects them.
      */
     struct SlotMeta
     {
@@ -165,11 +199,26 @@ namespace graph
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
         }
 
+        /** Device-scope acquire fence: orders the payload reads that follow
+         *  against the release that preceded the observed head advance. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC constexpr void claimAcquire(T_Acc const& acc) noexcept
+        {
+            alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::acquire);
+        }
+
         /** Device-scope atomic compare-exchange on a naturally aligned word. */
         template<typename T_Acc, typename T>
         ALPAKA_FN_ACC constexpr T atomicCasDevice(T_Acc const& acc, T* addr, T expected, T desired) noexcept
         {
             return alpaka::onAcc::atomicCas(acc, addr, expected, desired, alpaka::onAcc::scope::device);
+        }
+
+        /** Device-scope atomic add. */
+        template<typename T_Acc, typename T>
+        ALPAKA_FN_ACC constexpr T atomicAddDevice(T_Acc const& acc, T* addr, T value) noexcept
+        {
+            return alpaka::onAcc::atomicAdd(acc, addr, value, alpaka::onAcc::scope::device);
         }
     } // namespace pool_detail
 
@@ -181,7 +230,7 @@ namespace graph
      * All public methods are device-side (`ALPAKA_FN_ACC`) and warp-uniform:
      * every active lane of the calling warp must call the same method with the
      * same arguments, and only the lane selected by `WarpGroup::isLeader()`
-     * performs the locked work.
+     * performs the atomic work.
      *
      * The pool is a view over preallocated storage: it performs no allocation
      * and never outlives the storage it references.
@@ -191,6 +240,9 @@ namespace graph
     {
         static_assert(T_SlotCapacity >= 1u);
         static_assert(T_ElementCapacity >= 1u);
+        // The tagged head uses 31 index bits; a slot array larger than 2^31
+        // would not fit in the tag field.
+        static_assert(T_SlotCapacity < (1u << 31u), "slot capacity must fit the tagged free-list head");
 
     public:
         using Acc = std::remove_cvref_t<T_Acc>;
@@ -221,17 +273,24 @@ namespace graph
         static_assert(std::is_trivially_copyable_v<PoolSlot>);
         static_assert(std::is_standard_layout_v<PoolSlot>);
 
-        /** Pool header. Each word owns its own 64-byte cache line. */
+        /** Pool header. Each word owns its own 64-byte cache line.
+         *
+         * `freeListHead` is a tagged word: bit 31 is the tag, bits 0..30 are
+         * the slot index. `0` (index 0, tag 0) is the initial head after
+         * `configure()`; the terminator is `1u << 31` (tag 1, no index).
+         * `freeCount`, `violations`, and `headVersion` are device-scope atomic
+         * words updated with `atomicAdd`/`atomicCas` from multiple warps.
+         */
         struct PoolHeader
         {
-            std::uint32_t lock{0u};
-            std::uint64_t padLock[7]{};
-            SlotIndex freeListHead{invalidSlotIndex};
+            std::uint32_t freeListHead{0u};
             std::uint64_t padHead[7]{};
             std::uint64_t freeCount{0u};
             std::uint64_t padFree[7]{};
             std::uint64_t violations{0u};
             std::uint64_t padViolations[7]{};
+            std::uint32_t headVersion{0u};
+            std::uint64_t padVersion[7]{};
         };
 
         static_assert(std::is_trivially_copyable_v<PoolHeader>);
@@ -266,34 +325,34 @@ namespace graph
             if(warp.isLeader())
             {
                 auto* hdr = &header();
-                // Initialize slot metas in both branches so a misconfigured
-                // pool is still in a defined (if unusable) state.
-                for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
-                {
-                    slotAt(i).meta.generation = 0u;
-                    slotAt(i).meta.active = 0u;
-                }
                 if(requiredSlots(budget) > static_cast<std::uint32_t>(T_SlotCapacity))
                 {
-                    hdr->lock = 0u;
-                    hdr->freeListHead = invalidSlotIndex;
+                    hdr->freeListHead = headTag;
                     hdr->freeCount = 0u;
                     hdr->violations = 1u;
+                    hdr->headVersion = 0u;
+                    // Initialize slot metas so a misconfigured pool is still in
+                    // a defined (if unusable) state.
+                    for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
+                    {
+                        slotAt(i).meta.generation = 0u;
+                        slotAt(i).meta.active = 0u;
+                    }
                     pool_detail::publishRelease(acc);
                     ok = false;
                 }
                 else
                 {
-                    hdr->lock = 0u;
                     hdr->violations = 0u;
-                    hdr->freeListHead = 0u;
-                    hdr->freeCount = T_SlotCapacity;
+                    hdr->headVersion = 0u;
+                    hdr->freeCount = static_cast<std::uint64_t>(T_SlotCapacity);
+                    hdr->freeListHead = 0u; // index 0, tag 0
                     for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
                     {
                         auto* slot = &slotAt(i);
                         slot->meta.generation = 0u;
                         slot->meta.active = 0u;
-                        // Free-list encoding: next = i+1, terminated.
+                        // Free-list encoding: next = i+1, last slot terminates.
                         slot->record.handle.index
                             = (i + 1u < T_SlotCapacity) ? static_cast<SlotIndex>(i + 1u) : invalidSlotIndex;
                         slot->record.handle.generation = 0u;
@@ -301,6 +360,8 @@ namespace graph
                         slot->record.capacity = static_cast<std::uint32_t>(T_ElementCapacity);
                         slot->record.schema = ElementSchema{};
                     }
+                    // Publish every slot's free-list state and the initial head
+                    // before any warp may pop.
                     pool_detail::publishRelease(acc);
                 }
             }
@@ -313,52 +374,16 @@ namespace graph
          * Warp-uniform. On success, `out` holds the handle (index plus the
          * slot's new generation) and the slot's `record` is reset so the
          * caller fills in its schema and element count. The leader performs
-         * the locked work and the result is broadcast.
+         * the atomic work and the result is broadcast.
          *
-         * Returns `true` on success, `false` when no slot is free or the pool
-         * is locked.
+         * Returns `true` on success, `false` when no slot is free.
          */
         ALPAKA_FN_ACC constexpr bool acquire(Acc const& acc, WarpGroup<Acc> const& warp, PacketHandle& out) noexcept
         {
             bool ok = false;
             if(warp.isLeader())
             {
-                if(!tryLock(acc))
-                {
-                    ok = false;
-                }
-                else
-                {
-                    auto* hdr = &header();
-                    if(hdr->freeCount == 0u)
-                    {
-                        unlock(acc);
-                        ok = false;
-                    }
-                    else
-                    {
-                        auto const index = hdr->freeListHead;
-                        auto* slot = &slotAt(index);
-                        // Pop: the next free slot is encoded in the slot's
-                        // free-list fields.
-                        auto const nextFree = slot->record.handle.index;
-                        slot->meta.generation += 1u;
-                        slot->meta.active = 1u;
-                        slot->record.handle.index = index;
-                        slot->record.handle.generation = slot->meta.generation;
-                        slot->record.elementCount = 0u;
-                        slot->record.schema = ElementSchema{};
-                        // Publish the record before publishing the free-list
-                        // advance, so a concurrent acquirer that observes the
-                        // new head also observes the popped slot's new state.
-                        pool_detail::publishRelease(acc);
-                        hdr->freeListHead = nextFree;
-                        hdr->freeCount -= 1u;
-                        unlock(acc);
-                        ok = true;
-                        out = slot->record.handle;
-                    }
-                }
+                ok = popSlot(acc, out);
             }
             auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
             ok = warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
@@ -388,40 +413,7 @@ namespace graph
             bool ok = false;
             if(warp.isLeader())
             {
-                if(!tryLock(acc))
-                {
-                    ok = false;
-                }
-                else
-                {
-                    auto* hdr = &header();
-                    auto* slot = &slotAt(handle.index);
-                    auto const violation = slot->meta.generation != handle.generation || slot->meta.active == 0u;
-                    if(violation)
-                    {
-                        hdr->violations += 1u;
-                        unlock(acc);
-                        ok = false;
-                    }
-                    else
-                    {
-                        slot->meta.active = 0u;
-                        slot->meta.generation += 1u;
-                        // Push onto the free list: the slot's free-list field
-                        // points at the current head, then the head advances.
-                        slot->record.handle.index = hdr->freeListHead;
-                        slot->record.handle.generation = 0u;
-                        slot->record.elementCount = 0u;
-                        slot->record.schema = ElementSchema{};
-                        // Publish the slot's new free-list state before the
-                        // head advances.
-                        pool_detail::publishRelease(acc);
-                        hdr->freeListHead = handle.index;
-                        hdr->freeCount += 1u;
-                        unlock(acc);
-                        ok = true;
-                    }
-                }
+                ok = pushSlot(acc, handle);
             }
             auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
             return warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
@@ -504,6 +496,142 @@ namespace graph
         }
 
     private:
+        /** Tag bit of the free-list head: distinguishes the terminator
+         *  (tag 1, no index) from a real slot (tag 0). The free list never
+         *  pushes `invalidSlotIndex`, so the tag is the sole terminator mark. */
+        static constexpr std::uint32_t headTag = 1u << 31u;
+        static constexpr std::uint32_t headIndexMask = 0x7fff'ffffu;
+
+        /** Encode a slot index plus tag into the head word. */
+        static constexpr std::uint32_t encodeHead(std::uint32_t index, std::uint32_t tag) noexcept
+        {
+            return (index & headIndexMask) | (tag << 31u);
+        }
+
+        /** Decode the slot index of a head word (masked to 31 bits so a
+         *  terminator word decodes to a value the caller rejects). */
+        static constexpr std::uint32_t headIndex(std::uint32_t head) noexcept
+        {
+            return head & headIndexMask;
+        }
+
+        /** True when the head word is the terminator (no free slot). */
+        static constexpr bool headIsTerminator(std::uint32_t head) noexcept
+        {
+            return (head & headTag) != 0u;
+        }
+
+        /** Pop one slot from the free list via a CAS on the tagged head.
+         *
+         * The winner advances the head, increments the slot's generation and
+         * sets `active`, and publishes the record with a device-scope release
+         * before the head CAS. Returns false when the pool is empty.
+         */
+        ALPAKA_FN_ACC constexpr bool popSlot(Acc const& acc, PacketHandle& out) const noexcept
+        {
+            auto* hdr = &header();
+            // Read the head with a raw volatile load: the value is only a
+            // candidate for the CAS that follows, and a stale read is safe
+            // because the CAS re-validates it atomically.
+            std::uint32_t const expected = *reinterpret_cast<std::uint32_t volatile*>(&hdr->freeListHead);
+            if(headIsTerminator(expected))
+                return false;
+            std::uint32_t const index = headIndex(expected);
+            if(index >= static_cast<std::uint32_t>(T_SlotCapacity))
+                return false;
+            auto* slot = &slotAt(index);
+            // The successor is encoded in the slot's free-list field; it is
+            // stable while this slot is at the head (only a push of this
+            // slot can change it, and a push requires a release, which
+            // requires the slot to be held, which requires it off the list).
+            std::uint32_t const next = slot->record.handle.index;
+            // Acquire: order the slot reads below against the release that
+            // preceded the head advance that made this slot visible.
+            pool_detail::claimAcquire(acc);
+            // Bump the generation and mark the slot active. The meta stores are
+            // safe even if the CAS below fails: the slot is either still at the
+            // head (another warp will pop it and re-set the meta) or it has been
+            // released (the release re-checks the generation and records a
+            // violation if the handle is stale).
+            slot->meta.generation += 1u;
+            slot->meta.active = 1u;
+            slot->record.handle.index = index;
+            slot->record.handle.generation = slot->meta.generation;
+            slot->record.elementCount = 0u;
+            slot->record.schema = ElementSchema{};
+            // Release the record before publishing the head advance.
+            pool_detail::publishRelease(acc);
+            // Build the desired head: the successor's index with the
+            // terminator tag. The tag is what closes the ABA window: a
+            // stale CAS against a head that has cycled through the same
+            // index fails because the tag differs.
+            std::uint32_t const desiredTag = (next == invalidSlotIndex) ? 1u : 0u;
+            std::uint32_t const desired = encodeHead(next, desiredTag);
+            std::uint32_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
+            if(result == expected)
+            {
+                (void) pool_detail::atomicAddDevice(acc, &hdr->headVersion, std::uint32_t{1u});
+                // Decrement: freeCount is a uint64_t; the value -1 wraps to
+                // 0xFFFF...FFFF which is the correct 2's-complement decrement.
+                (void) pool_detail::atomicAddDevice(acc, &hdr->freeCount, ~std::uint64_t{0u});
+                out.index = index;
+                out.generation = slot->meta.generation;
+                return true;
+            }
+            // CAS failed: another warp moved the head. The meta stores above
+            // are safe: the slot is either still at the head (the next popper
+            // re-sets the meta) or it has been released (the release re-checks
+            // the generation and records a violation if the handle is stale).
+            return false;
+        }
+
+        /** Push one slot back onto the free list via a CAS on the tagged head.
+         *
+         * The handle must be valid (generation matches, slot active). On
+         * success the slot's `meta.active` is cleared, its generation is
+         * incremented (so a stale handle no longer matches), and the slot is
+         * linked at the head. A violation leaves the free list untouched.
+         */
+        ALPAKA_FN_ACC constexpr bool pushSlot(Acc const& acc, PacketHandle const& handle) const noexcept
+        {
+            auto* hdr = &header();
+            if(handle.index >= static_cast<std::uint32_t>(T_SlotCapacity))
+                return false;
+            auto* slot = &slotAt(handle.index);
+            if(slot->meta.generation != handle.generation || slot->meta.active == 0u)
+            {
+                (void) pool_detail::atomicAddDevice(acc, &hdr->violations, std::uint64_t{1u});
+                return false;
+            }
+            for(std::uint32_t attempt = 0u; attempt < (1u << 20u); ++attempt)
+            {
+                std::uint32_t const expected = *reinterpret_cast<std::uint32_t volatile*>(&hdr->freeListHead);
+                // Link this slot at the head: its next field points at the
+                // current head's index (or the terminator).
+                slot->record.handle.index = headIsTerminator(expected) ? invalidSlotIndex : headIndex(expected);
+                slot->record.handle.generation = 0u;
+                slot->record.elementCount = 0u;
+                slot->record.schema = ElementSchema{};
+                // Clear active and bump the generation: a stale handle no
+                // longer matches, so a second release of the same handle is
+                // rejected by the generation check.
+                slot->meta.active = 0u;
+                slot->meta.generation += 1u;
+                // Release the slot's new free-list state before the head CAS.
+                pool_detail::publishRelease(acc);
+                std::uint32_t const desired = encodeHead(handle.index, 0u);
+                std::uint32_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
+                if(result == expected)
+                {
+                    (void) pool_detail::atomicAddDevice(acc, &hdr->headVersion, std::uint32_t{1u});
+                    (void) pool_detail::atomicAddDevice(acc, &hdr->freeCount, std::uint64_t{1u});
+                    return true;
+                }
+                // CAS failed: retry with the new head.
+            }
+            return false;
+        }
+
         [[nodiscard]] ALPAKA_FN_ACC constexpr PoolHeader& header() const noexcept
         {
             return *reinterpret_cast<PoolHeader*>(m_storage);
@@ -512,18 +640,6 @@ namespace graph
         [[nodiscard]] ALPAKA_FN_ACC constexpr PoolSlot& slotAt(std::size_t index) const noexcept
         {
             return *reinterpret_cast<PoolSlot*>(m_storage + headerBytes + index * slotBytes);
-        }
-
-        ALPAKA_FN_ACC constexpr bool tryLock(Acc const& acc) const noexcept
-        {
-            return pool_detail::atomicCasDevice(acc, &header().lock, std::uint32_t{0u}, std::uint32_t{1u})
-                   == std::uint32_t{0u};
-        }
-
-        ALPAKA_FN_ACC constexpr void unlock(Acc const& acc) const noexcept
-        {
-            pool_detail::publishRelease(acc);
-            pool_detail::atomicCasDevice(acc, &header().lock, std::uint32_t{1u}, std::uint32_t{0u});
         }
 
         /** Broadcast the handle from the leader to all lanes. */

@@ -114,20 +114,26 @@ namespace graph
             return job;
         }
 
-        /** Effective soft cap of importer-published ready entries. */
+        /** Effective soft cap of importer-published ready entries.
+         *
+         * The cap never exceeds the hard ring capacity minus the per-worker
+         * reservation (`3 * workerCount`), so the importer cannot fill the ring
+         * past the space the workers need for their own publications. The
+         * per-worker reservation covers at most one in-flight job, one
+         * continuation, and one successor.
+         */
         ALPAKA_FN_HOST inline std::uint32_t derivedReadySoftLimit(
             PoolConfig const& config,
             LaunchGeometry const& geometry) noexcept
         {
+            std::uint64_t const hard = static_cast<std::uint64_t>(poolReadyCapacity);
             std::uint64_t const reserved = 3u * static_cast<std::uint64_t>(geometry.workerCount);
-            std::uint64_t const packetLimit = static_cast<std::uint64_t>(poolPacketSlotCapacity) - reserved
-                                              - static_cast<std::uint64_t>(poolStagingCapacity) - 64u;
-            std::uint64_t const readyLimit = static_cast<std::uint64_t>(poolReadyCapacity) > reserved
-                                                 ? static_cast<std::uint64_t>(poolReadyCapacity) - reserved
-                                                 : 0u;
+            std::uint64_t const readyLimit = hard > reserved ? hard - reserved : 0u;
             std::uint64_t const limit = config.maxReadyInFlight == 0u
-                                            ? (packetLimit < readyLimit ? packetLimit : readyLimit)
-                                            : static_cast<std::uint64_t>(config.maxReadyInFlight);
+                                            ? readyLimit
+                                            : (static_cast<std::uint64_t>(config.maxReadyInFlight) < readyLimit
+                                                   ? static_cast<std::uint64_t>(config.maxReadyInFlight)
+                                                   : readyLimit);
             return static_cast<std::uint32_t>(limit);
         }
 

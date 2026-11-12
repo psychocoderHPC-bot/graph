@@ -483,7 +483,8 @@ namespace graph
 
                 bool hasRoom = false;
                 if(runtime.warp.isLeader())
-                    hasRoom = runtime.ring.inFlightCount() < runtime.args.readySoftLimit;
+                    hasRoom = runtime.ring.inFlightCount() < runtime.args.readySoftLimit
+                              && runtime.pool.freeCount() > runtime.args.workers;
                 hasRoom = broadcastU32(runtime, hasRoom ? 1u : 0u) != 0u;
                 if(!hasRoom)
                     break;
@@ -546,7 +547,8 @@ namespace graph
 
             bool hasRoom = false;
             if(runtime.warp.isLeader())
-                hasRoom = runtime.ring.inFlightCount() < runtime.args.readySoftLimit;
+                hasRoom = runtime.ring.inFlightCount() < runtime.args.readySoftLimit
+                          && runtime.pool.freeCount() > runtime.args.workers;
             hasRoom = broadcastU32(runtime, hasRoom ? 1u : 0u) != 0u;
             if(!hasRoom)
                 return;
