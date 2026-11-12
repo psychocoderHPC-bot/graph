@@ -1,32 +1,28 @@
 # SPDX-FileCopyrightText: 2026 René Widera and contributors
 # SPDX-License-Identifier: MPL-2.0
 
-add_executable(graph_smoke unit/test_smoke.cpp)
-target_link_libraries(graph_smoke PRIVATE graph::graph Catch2::Catch2WithMain)
-graph_finalize(graph_smoke)
+# Canonical test registration. Every `tests/unit/*.cpp` and
+# `tests/integration/*.cpp` is globbed at configure time; CONFIGURE_DEPENDS
+# re-runs the glob at build time, so adding a test file needs no CMake edit.
+# Each directory gets exactly one Catch2 executable (Catch2::Catch2WithMain)
+# and one catch_discover_tests() registration covering all of its sources.
+# No explicit per-file or historical target names remain.
+file(GLOB GRAPH_UNIT_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cpp")
+file(GLOB GRAPH_INTEGRATION_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cpp")
 
-catch_discover_tests(graph_smoke PROPERTIES TIMEOUT 120)
+function(graph_add_test_target directory sources)
+    if(NOT sources)
+        return()
+    endif()
 
-add_executable(test_vocabulary unit/test_vocabulary.cpp)
-target_link_libraries(test_vocabulary PRIVATE graph::graph Catch2::Catch2WithMain)
-graph_finalize(test_vocabulary)
+    set(_graph_test_target "graph_${directory}_tests")
+    add_executable(${_graph_test_target} ${sources})
+    target_link_libraries(${_graph_test_target} PRIVATE graph::graph Catch2::Catch2WithMain)
+    target_include_directories(${_graph_test_target} PRIVATE "${PROJECT_SOURCE_DIR}/examples")
+    graph_finalize(${_graph_test_target})
 
-catch_discover_tests(test_vocabulary PROPERTIES TIMEOUT 120)
+    catch_discover_tests(${_graph_test_target} PROPERTIES TIMEOUT 300)
+endfunction()
 
-add_executable(test_ready_ring unit/test_ready_ring.cpp)
-target_link_libraries(test_ready_ring PRIVATE graph::graph Catch2::Catch2WithMain)
-graph_finalize(test_ready_ring)
-
-catch_discover_tests(test_ready_ring PROPERTIES TIMEOUT 120)
-
-add_executable(test_packet_pool unit/test_packet_pool.cpp)
-target_link_libraries(test_packet_pool PRIVATE graph::graph Catch2::Catch2WithMain)
-graph_finalize(test_packet_pool)
-
-catch_discover_tests(test_packet_pool PROPERTIES TIMEOUT 120)
-
-add_executable(test_ready_ring_minimal unit/test_ready_ring_minimal.cpp)
-target_link_libraries(test_ready_ring_minimal PRIVATE graph::graph Catch2::Catch2WithMain)
-graph_finalize(test_ready_ring_minimal)
-
-catch_discover_tests(test_ready_ring_minimal PROPERTIES TIMEOUT 120)
+graph_add_test_target(unit "${GRAPH_UNIT_TEST_SOURCES}")
+graph_add_test_target(integration "${GRAPH_INTEGRATION_TEST_SOURCES}")

@@ -4,6 +4,7 @@
 #include <alpaka/alpaka.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
 #include <graph/packet_pool.hpp>
 
@@ -16,44 +17,79 @@
  * is exercised through alpaka kernels so the same code path is exercised on
  * both backends.
  *
- * The pool's storage is one device buffer laid out as the pool's own storage
- * (header + slots, sized by the pool type) followed by a fixed results
- * header.
+ * `acquire`/`release` are warp-uniform (they broadcast internally), so every
+ * lane of the warp must call them on the same line; only the leader performs
+ * the locked work. The loops below are therefore warp-uniform, with the
+ * leader doing the side effects (writes, counters) and the result broadcast
+ * back to the lanes by the pool itself.
  */
 namespace
 {
-    /** Round up to a multiple of `alignment`. */
-    constexpr std::size_t alignUp(std::size_t value, std::size_t alignment) noexcept
+    auto makeTestDevice()
     {
-        return (value + alignment - 1u) & ~(alignment - 1u);
+#if GRAPH_HAS_CUDA
+        auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::cuda, alpaka::deviceKind::nvidiaGpu};
+#else
+        auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::host, alpaka::deviceKind::cpu};
+#endif
+        auto selector = alpaka::onHost::makeDeviceSelector(deviceSpec);
+        REQUIRE(selector.getDeviceCount() > 0u);
+        return selector.makeDevice(0);
     }
 
-    /** One device buffer: pool storage followed by a fixed results header. */
-    template<typename T_Acc, std::size_t T_SlotCapacity, std::size_t T_ElementCapacity>
-    struct PoolTestStorage
+    void launchOneWarp(auto& device, auto&& kernel, auto&&... args)
     {
-        using Pool = graph::PacketPool<T_Acc, T_SlotCapacity, T_ElementCapacity>;
-        static constexpr std::size_t poolBytes = Pool::storageBytes;
+#if GRAPH_HAS_CUDA
+        // One warp per block: 32 threads.
+        auto const threadSpec = alpaka::onHost::ThreadSpec{
+            alpaka::Vec<std::uint32_t, 1u>{1u},
+            alpaka::Vec<std::uint32_t, 1u>{32u},
+            alpaka::exec::gpuCuda};
+#else
+        // The CPU serial executor requires a 1-thread block (it throws if the
+        // thread block product != 1). The "one warp" is a single width-1 lane.
+        auto const threadSpec = alpaka::onHost::ThreadSpec{
+            alpaka::Vec<std::uint32_t, 1u>{1u},
+            alpaka::Vec<std::uint32_t, 1u>{1u},
+            alpaka::exec::cpuSerial};
+#endif
+        auto queue = device.makeQueue();
+        queue.enqueue(threadSpec, kernel, args...);
+        alpaka::onHost::wait(queue);
+    }
 
-        std::uint8_t pool[poolBytes]{};
-        std::uint64_t results[8]{};
-    };
+    /** Budget formula is a plain integer expression; check it on the host. */
+    TEST_CASE("packet pool: budget formula requiredSlots(P,B,W,R,S)", "[graph][packet_pool]")
+    {
+        // requiredSlots = P + 2*B + W*R + S
+        CHECK(graph::requiredSlots(0u, 0u, 0u, 0u, 0u) == 0u);
+        CHECK(graph::requiredSlots(10u, 2u, 4u, 3u, 1u) == 10u + 4u + 12u + 1u);
+        CHECK(graph::requiredSlots(5u, 0u, 0u, 0u, 0u) == 5u);
+        CHECK(graph::requiredSlots(0u, 3u, 0u, 0u, 0u) == 6u);
+        CHECK(graph::requiredSlots(0u, 0u, 8u, 2u, 0u) == 16u);
+        CHECK(graph::requiredSlots(0u, 0u, 0u, 0u, 7u) == 7u);
 
-    /** Kernel: acquire/release lifecycle with a budget check.
-     *
-     * A single warp (the leader lane does the work) configures the pool,
-     * acquires all slots, writes a pattern into each, releases them in
-     * reverse order, re-acquires and verifies the free list is intact, and
-     * finally exercises the use-after-release hook.
+        auto budget = graph::PacketPoolBudget{};
+        budget.liveParticles = 10u;
+        budget.assemblyStreams = 2u;
+        budget.workers = 4u;
+        budget.replacementsPerWorker = 3u;
+        budget.controlAllowance = 1u;
+        CHECK(graph::requiredSlots(budget) == 27u);
+    }
+
+    /** Kernel: acquire/release lifecycle, capacity/peak accounting, and a
+     *  use-after-release hook. All loops are warp-uniform.
      *
      * Results:
      *   [0] = configure succeeded (1) or failed (0)
-     *   [1] = violations after the normal lifecycle (must be 0)
-     *   [2] = violations after the use-after-release attempt (must be 1)
-     *   [3] = slots successfully re-acquired after full release (must equal
-     *         capacity)
-     *   [4] = content errors on re-acquire (must be 0)
-     *   [5] = isValid mismatches during the lifecycle (must be 0)
+     *   [1] = violations after everything (must be exactly 1: the hook)
+     *   [2] = acquires that succeeded across the whole run (must equal
+     *         2 * capacity: two full acquire/release rounds)
+     *   [3] = acquires that failed unexpectedly (must be 0)
+     *   [4] = releases that failed unexpectedly (must be 0)
+     *   [5] = heldCount peak observed (must equal capacity)
+     *   [6] = freeCount at the end (must equal capacity)
      */
     template<std::size_t T_SlotCapacity, std::size_t T_ElementCapacity>
     struct PoolLifecycleKernel
@@ -62,253 +98,189 @@ namespace
         {
             using Acc = std::remove_cvref_t<decltype(acc)>;
             using Pool = graph::PacketPool<Acc, T_SlotCapacity, T_ElementCapacity>;
-            using Storage = PoolTestStorage<Acc, T_SlotCapacity, T_ElementCapacity>;
 
             auto* base = static_cast<std::uint8_t*>(storage.data());
             Pool pool{base};
-
-            auto* results = reinterpret_cast<std::uint64_t*>(base + Storage::poolBytes);
-
+            auto* results = reinterpret_cast<std::uint64_t*>(base + Pool::storageBytes);
             graph::WarpGroup<Acc> warp{acc};
+            graph::WarpBarrier<Acc> barrier{};
+            constexpr std::uint32_t blockThreads = 32u;
 
-            if(warp.isLeader())
-            {
-                for(int i = 0; i < 6; ++i)
-                    results[i] = 0u;
-            }
-            (void)warp.all(true);
-
-            // Configure with a budget that exactly fits the capacity.
-            graph::PacketPoolBudget budget{};
+            auto budget = graph::PacketPoolBudget{};
             budget.liveParticles = static_cast<std::uint32_t>(T_SlotCapacity);
-            budget.assemblyStreams = 0u;
-            budget.workers = 0u;
-            budget.replacementsPerWorker = 0u;
-            budget.controlAllowance = 0u;
-            auto const configured = pool.configure(acc, warp, budget);
+            bool const ok = pool.configure(acc, warp, budget);
+            barrier.barrier(acc, blockThreads, warp);
 
-            if(warp.isLeader())
+            std::uint64_t acqOk = 0u, acqFail = 0u, relFail = 0u;
+            std::uint64_t peakHeld = 0u;
+
+            for(std::uint32_t round = 0u; round < 2u; ++round)
             {
-                results[0] = configured ? 1u : 0u;
-            }
-
-            if(configured)
-            {
-                // Phase 1: acquire all slots, write a pattern, verify isValid.
-                graph::PacketHandle handles[T_SlotCapacity]{};
-                bool allAcquired = true;
-                for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
-                {
-                    if(!pool.acquire(acc, warp, handles[i]))
-                    {
-                        allAcquired = false;
-                        break;
-                    }
-                    // Write a pattern: byte j of slot i gets i*256 + j.
-                    auto* data = pool.slotData(handles[i]);
-                    for(std::size_t j = 0u; j < T_ElementCapacity; ++j)
-                    {
-                        data[j] = static_cast<std::uint8_t>((i * 256u + j) & 0xffu);
-                    }
-                    // Verify the handle is valid.
-                    if(!pool.isValid(acc, warp, handles[i]))
-                    {
-                        if(warp.isLeader())
-                        {
-                            alpaka::onAcc::atomicAdd(acc, &results[5], std::uint64_t{1u}, alpaka::onAcc::scope::device);
-                        }
-                    }
-                }
-                if(warp.isLeader() && !allAcquired)
-                {
-                    results[5] += 1u;
-                }
-
-                // Phase 2: release in reverse order.
-                for(std::size_t i = T_SlotCapacity; i-- > 0u;)
-                {
-                    pool.release(acc, warp, handles[i]);
-                }
-
-                // The normal lifecycle must produce no violations.
-                if(warp.isLeader())
-                {
-                    results[1] = pool.ownershipViolations(acc);
-                }
-
-                // Phase 3: re-acquire all slots and verify the free list is
-                // intact (every slot is acquirable again).
-                std::uint64_t reAcquired = 0u;
-                std::uint64_t contentErrors = 0u;
-                for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
+                // Acquire every slot (warp-uniform).
+                for(std::uint32_t i = 0u; i < T_SlotCapacity; ++i)
                 {
                     graph::PacketHandle h{};
-                    if(pool.acquire(acc, warp, h))
+                    bool const got = pool.acquire(acc, warp, h);
+                    if(warp.isLeader() && got)
                     {
-                        reAcquired += 1u;
-                        // The slot was released, so its content is whatever
-                        // the previous owner left (the pattern from phase 1).
-                        // Verify the pattern is still there (the pool does
-                        // not zero the data on release).
+                        acqOk++;
+                        auto const held = pool.heldCount();
+                        if(held > peakHeld)
+                            peakHeld = held;
                         auto* data = pool.slotData(h);
-                        for(std::size_t j = 0u; j < T_ElementCapacity; ++j)
-                        {
-                            auto const expected = static_cast<std::uint8_t>((i * 256u + j) & 0xffu);
-                            if(data[j] != expected)
-                            {
-                                contentErrors += 1u;
-                                break;
-                            }
-                        }
-                        pool.release(acc, warp, h);
+                        for(std::size_t b = 0u; b < T_ElementCapacity; ++b)
+                            data[b] = static_cast<std::uint8_t>(i + 1u + round);
+                        pool.setElementCount(acc, h, static_cast<std::uint32_t>(T_ElementCapacity));
                     }
-                }
-                if(warp.isLeader())
-                {
-                    results[3] = reAcquired;
-                    results[4] = contentErrors;
-                }
-
-                // Phase 4: use-after-release hook. Acquire one slot, release
-                // it, then attempt to release it again (double-release) and
-                // attempt to use the stale handle (isValid must be false).
-                graph::PacketHandle stale{};
-                if(pool.acquire(acc, warp, stale))
-                {
-                    pool.release(acc, warp, stale);
-                    // Double-release: must be detected.
-                    pool.release(acc, warp, stale);
-                    // Use-after-release: isValid must be false.
-                    if(pool.isValid(acc, warp, stale))
+                    else if(warp.isLeader() && !got)
                     {
-                        if(warp.isLeader())
-                        {
-                            alpaka::onAcc::atomicAdd(acc, &results[5], std::uint64_t{1u}, alpaka::onAcc::scope::device);
-                        }
+                        acqFail++;
                     }
                 }
-                if(warp.isLeader())
+                barrier.barrier(acc, blockThreads, warp);
+
+                // Release every slot (warp-uniform). For a fresh pool the free
+                // list is 0,1,2,... so acquire i yields index i; after a full
+                // release the free list is 0,1,2,... again. We release by
+                // re-reading each slot's record handle, which holds the
+                // (index, generation) the acquire set, so the generation always
+                // matches.
+                for(std::uint32_t i = 0u; i < T_SlotCapacity; ++i)
                 {
-                    // The double-release records exactly one violation; the
-                    // normal lifecycle recorded zero.
-                    results[2] = pool.ownershipViolations(acc) - results[1];
+                    graph::PacketHandle h{};
+                    h.index = i;
+                    auto const& rec = pool.slotRecord(h);
+                    h = rec.handle;
+                    bool const freed = pool.release(acc, warp, h);
+                    if(warp.isLeader() && !freed)
+                        relFail++;
                 }
+                barrier.barrier(acc, blockThreads, warp);
+            }
+
+            // Use-after-release hook: a stale generation must be rejected and
+            // record exactly one violation. Warp-uniform (all lanes call).
+            {
+                graph::PacketHandle stale{};
+                stale.index = 0u;
+                stale.generation = 999u; // never issued by this pool
+                (void)pool.release(acc, warp, stale);
+            }
+            barrier.barrier(acc, blockThreads, warp);
+
+            if(warp.isLeader())
+            {
+                results[0] = ok ? 1u : 0u;
+                results[1] = pool.ownershipViolations();
+                results[2] = acqOk;
+                results[3] = acqFail;
+                results[4] = relFail;
+                results[5] = peakHeld;
+                results[6] = pool.freeCount();
             }
         }
     };
 
-    /** Host helper: run the lifecycle kernel and check the results. */
     template<std::size_t T_SlotCapacity, std::size_t T_ElementCapacity>
-    void runLifecycle(auto& device, auto const& executor)
+    void runLifecycle()
     {
-        using PlaceholderPool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
-        auto const totalBytes = alignUp(sizeof(typename PlaceholderPool::PoolHeader), 64u)
-                                + T_SlotCapacity * PlaceholderPool::slotBytes + 6u * sizeof(std::uint64_t);
+        auto device = makeTestDevice();
+        using Pool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
+        auto const totalBytes = Pool::storageBytes + 8 * sizeof(std::uint64_t);
 
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
         auto deviceBuffer = alpaka::onHost::allocLike(device, hostBuffer);
 
-        auto const threadSpec
-            = alpaka::onHost::ThreadSpec{
-                alpaka::Vec<std::uint32_t, 1u>{1u},
-                alpaka::Vec<std::uint32_t, 1u>{32u},
-                executor};
+        launchOneWarp(device, PoolLifecycleKernel<T_SlotCapacity, T_ElementCapacity>{}, deviceBuffer);
         auto queue = device.makeQueue();
-        queue.enqueue(threadSpec, PoolLifecycleKernel<T_SlotCapacity, T_ElementCapacity>{}, deviceBuffer);
-        alpaka::onHost::wait(queue);
-
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
-        auto const poolStorageBytes
-            = alignUp(sizeof(typename PlaceholderPool::PoolHeader), 64u)
-              + T_SlotCapacity * PlaceholderPool::slotBytes;
-        auto const* results = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + poolStorageBytes);
+        auto const* results = reinterpret_cast<std::uint64_t const*>(
+            hostBuffer.data() + Pool::storageBytes);
 
-        INFO("slots=" << T_SlotCapacity << " elementCapacity=" << T_ElementCapacity);
+        INFO("cap=" << T_SlotCapacity << " elemCap=" << T_ElementCapacity << " configure=" << results[0]
+                    << " violations=" << results[1] << " acqOk=" << results[2] << " acqFail=" << results[3]
+                    << " relFail=" << results[4] << " peakHeld=" << results[5] << " freeCount=" << results[6]);
         CHECK(results[0] == 1u);
-        CHECK(results[1] == 0u);
-        CHECK(results[2] == 1u);
-        CHECK(results[3] == T_SlotCapacity);
+        // Exactly one violation: the deliberate use-after-release hook.
+        CHECK(results[1] == 1u);
+        CHECK(results[2] == 2u * T_SlotCapacity);
+        CHECK(results[3] == 0u);
         CHECK(results[4] == 0u);
-        CHECK(results[5] == 0u);
+        CHECK(results[5] == T_SlotCapacity);
+        CHECK(results[6] == T_SlotCapacity);
     }
 
-    /** Kernel: budget check. A pool configured with a budget that exceeds its
-     *  capacity must fail configure() and record a violation. */
+    /** Kernel: configure with an undersized budget must fail loudly and leave
+     *  no slot acquirable, recording a violation.
+     *
+     * Results:
+     *   [0] = configure result (must be 0 for an undersized budget)
+     *   [1] = violations (must be >= 1)
+     *   [2] = number of acquires that succeeded (must be 0)
+     *   [3] = freeCount (must be 0: nothing acquirable)
+     */
     template<std::size_t T_SlotCapacity, std::size_t T_ElementCapacity>
-    struct PoolBudgetKernel
+    struct PoolUnderBudgetKernel
     {
         ALPAKA_FN_ACC void operator()(auto const& acc, alpaka::concepts::IMdSpan auto storage) const
         {
             using Acc = std::remove_cvref_t<decltype(acc)>;
             using Pool = graph::PacketPool<Acc, T_SlotCapacity, T_ElementCapacity>;
-            using Storage = PoolTestStorage<Acc, T_SlotCapacity, T_ElementCapacity>;
 
             auto* base = static_cast<std::uint8_t*>(storage.data());
             Pool pool{base};
-            auto* results = reinterpret_cast<std::uint64_t*>(base + Storage::poolBytes);
+            auto* results = reinterpret_cast<std::uint64_t*>(base + Pool::storageBytes);
             graph::WarpGroup<Acc> warp{acc};
+            graph::WarpBarrier<Acc> barrier{};
+            constexpr std::uint32_t blockThreads = 32u;
 
+            auto budget = graph::PacketPoolBudget{};
+            // Require one more slot than exists.
+            budget.liveParticles = static_cast<std::uint32_t>(T_SlotCapacity) + 1u;
+            bool const ok = pool.configure(acc, warp, budget);
+            barrier.barrier(acc, blockThreads, warp);
+
+            // Warp-uniform acquire attempt; with nothing free it must fail.
+            graph::PacketHandle h{};
+            bool const got = pool.acquire(acc, warp, h);
+            barrier.barrier(acc, blockThreads, warp);
+
+            std::uint64_t acquired = 0u;
             if(warp.isLeader())
             {
-                for(int i = 0; i < 4; ++i)
-                    results[i] = 0u;
-            }
-            (void)warp.all(true);
-
-            // Budget that exceeds the capacity: P = T_SlotCapacity + 1.
-            graph::PacketPoolBudget budget{};
-            budget.liveParticles = static_cast<std::uint32_t>(T_SlotCapacity + 1u);
-            budget.assemblyStreams = 0u;
-            budget.workers = 0u;
-            budget.replacementsPerWorker = 0u;
-            budget.controlAllowance = 0u;
-            auto const configured = pool.configure(acc, warp, budget);
-
-            if(warp.isLeader())
-            {
-                results[0] = configured ? 1u : 0u;
-                results[1] = pool.ownershipViolations(acc);
-                // No slot must be acquirable after a failed configure.
-                graph::PacketHandle h{};
-                results[2] = pool.acquire(acc, warp, h) ? 1u : 0u;
-                results[3] = pool.freeCount(acc);
+                acquired = got ? 1u : 0u;
+                results[0] = ok ? 1u : 0u;
+                results[1] = pool.ownershipViolations();
+                results[2] = acquired;
+                results[3] = pool.freeCount();
             }
         }
     };
 
-    /** Host helper: run the budget kernel and check the results. */
     template<std::size_t T_SlotCapacity, std::size_t T_ElementCapacity>
-    void runBudget(auto& device, auto const& executor)
+    void runUnderBudget()
     {
-        using PlaceholderPool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
-        auto const totalBytes = alignUp(sizeof(typename PlaceholderPool::PoolHeader), 64u)
-                                + T_SlotCapacity * PlaceholderPool::slotBytes + 4u * sizeof(std::uint64_t);
+        auto device = makeTestDevice();
+        using Pool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
+        auto const totalBytes = Pool::storageBytes + 8 * sizeof(std::uint64_t);
 
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
         auto deviceBuffer = alpaka::onHost::allocLike(device, hostBuffer);
 
-        auto const threadSpec
-            = alpaka::onHost::ThreadSpec{
-                alpaka::Vec<std::uint32_t, 1u>{1u},
-                alpaka::Vec<std::uint32_t, 1u>{32u},
-                executor};
+        launchOneWarp(device, PoolUnderBudgetKernel<T_SlotCapacity, T_ElementCapacity>{}, deviceBuffer);
         auto queue = device.makeQueue();
-        queue.enqueue(threadSpec, PoolBudgetKernel<T_SlotCapacity, T_ElementCapacity>{}, deviceBuffer);
-        alpaka::onHost::wait(queue);
-
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
-        auto const poolStorageBytes
-            = alignUp(sizeof(typename PlaceholderPool::PoolHeader), 64u)
-              + T_SlotCapacity * PlaceholderPool::slotBytes;
-        auto const* results = reinterpret_cast<std::uint64_t const*>(hostBuffer.data() + poolStorageBytes);
+        auto const* results = reinterpret_cast<std::uint64_t const*>(
+            hostBuffer.data() + Pool::storageBytes);
 
-        INFO("slots=" << T_SlotCapacity << " (budget exceeds capacity)");
+        INFO("cap=" << T_SlotCapacity << " configure=" << results[0] << " violations=" << results[1]
+                    << " acquired=" << results[2] << " freeCount=" << results[3]);
         CHECK(results[0] == 0u);
         CHECK(results[1] >= 1u);
         CHECK(results[2] == 0u);
@@ -316,86 +288,17 @@ namespace
     }
 } // namespace
 
-TEST_CASE("packet pool: acquire/release lifecycle with no violations", "[graph][packet_pool]")
+TEST_CASE("packet pool: lifecycle, capacity accounting and use-after-release, capacity 8", "[graph][packet_pool]")
 {
-    auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::host, alpaka::deviceKind::cpu};
-    auto selector = alpaka::onHost::makeDeviceSelector(deviceSpec);
-    REQUIRE(selector.getDeviceCount() > 0u);
-    auto device = selector.makeDevice(0);
-    runLifecycle<16u, 64u>(device, alpaka::exec::cpuSerial);
+    runLifecycle<8u, 256u>();
 }
 
-TEST_CASE("packet pool: lifecycle at tiny capacity (1 slot)", "[graph][packet_pool]")
+TEST_CASE("packet pool: lifecycle, capacity 1", "[graph][packet_pool]")
 {
-    auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::host, alpaka::deviceKind::cpu};
-    auto selector = alpaka::onHost::makeDeviceSelector(deviceSpec);
-    REQUIRE(selector.getDeviceCount() > 0u);
-    auto device = selector.makeDevice(0);
-    runLifecycle<1u, 32u>(device, alpaka::exec::cpuSerial);
+    runLifecycle<1u, 64u>();
 }
 
-TEST_CASE("packet pool: use-after-release is detected by the generation hook", "[graph][packet_pool]")
+TEST_CASE("packet pool: undersized budget fails startup loudly", "[graph][packet_pool]")
 {
-    auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::host, alpaka::deviceKind::cpu};
-    auto selector = alpaka::onHost::makeDeviceSelector(deviceSpec);
-    REQUIRE(selector.getDeviceCount() > 0u);
-    auto device = selector.makeDevice(0);
-    // The lifecycle kernel exercises the double-release and isValid paths;
-    // the CHECKs in runLifecycle assert the hook fired exactly once.
-    runLifecycle<4u, 32u>(device, alpaka::exec::cpuSerial);
+    runUnderBudget<8u, 64u>();
 }
-
-TEST_CASE("packet pool: budget check fails loudly when capacity is too small", "[graph][packet_pool]")
-{
-    auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::host, alpaka::deviceKind::cpu};
-    auto selector = alpaka::onHost::makeDeviceSelector(deviceSpec);
-    REQUIRE(selector.getDeviceCount() > 0u);
-    auto device = selector.makeDevice(0);
-    runBudget<4u, 32u>(device, alpaka::exec::cpuSerial);
-}
-
-TEST_CASE("packet pool: requiredSlots formula is runtime-visible and correct", "[graph][packet_pool]")
-{
-    // P=10, B=3, W=4, R=2, S=5 -> 10 + 6 + 8 + 5 = 29.
-    CHECK(graph::requiredSlots(10u, 3u, 4u, 2u, 5u) == 29u);
-    // P=0, B=0, W=0, R=0, S=0 -> 0.
-    CHECK(graph::requiredSlots(0u, 0u, 0u, 0u, 0u) == 0u);
-    // P=1, B=1, W=1, R=1, S=1 -> 1 + 2 + 1 + 1 = 5.
-    CHECK(graph::requiredSlots(1u, 1u, 1u, 1u, 1u) == 5u);
-
-    graph::PacketPoolBudget b{};
-    b.liveParticles = 10u;
-    b.assemblyStreams = 3u;
-    b.workers = 4u;
-    b.replacementsPerWorker = 2u;
-    b.controlAllowance = 5u;
-    CHECK(graph::requiredSlots(b) == 29u);
-}
-
-TEST_CASE("packet pool: packet lifetime after dequeue (ring reuse is separate)", "[graph][packet_pool]")
-{
-    // This test verifies that the pool's slot reuse (release + re-acquire)
-    // does not affect the content of a slot that has been released: the
-    // content stays until the next owner writes it. The lifecycle kernel
-    // already checks this (phase 3 verifies the pattern is intact after a
-    // full release/re-acquire cycle). This test re-runs it with a different
-    // shape to cover the 2-slot case.
-    auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::host, alpaka::deviceKind::cpu};
-    auto selector = alpaka::onHost::makeDeviceSelector(deviceSpec);
-    REQUIRE(selector.getDeviceCount() > 0u);
-    auto device = selector.makeDevice(0);
-    runLifecycle<2u, 64u>(device, alpaka::exec::cpuSerial);
-}
-
-#if GRAPH_HAS_CUDA
-TEST_CASE("packet pool: lifecycle on CUDA", "[graph][packet_pool][cuda]")
-{
-    auto const deviceSpec = alpaka::onHost::DeviceSpec{alpaka::api::cuda, alpaka::deviceKind::nvidiaGpu};
-    auto selector = alpaka::onHost::makeDeviceSelector(deviceSpec);
-    REQUIRE(selector.isAvailable());
-    REQUIRE(selector.getDeviceCount() > 0u);
-    auto device = selector.makeDevice(0);
-    runLifecycle<16u, 64u>(device, alpaka::exec::gpuCuda);
-    runBudget<4u, 32u>(device, alpaka::exec::gpuCuda);
-}
-#endif

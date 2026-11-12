@@ -6,9 +6,9 @@
 #include <alpaka/alpaka.hpp>
 
 #include <graph/detail/concepts.hpp>
-#include <graph/detail/job.hpp>
 #include <graph/detail/packet.hpp>
 #include <graph/detail/views.hpp>
+#include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
 
 #include <cstddef>
@@ -17,8 +17,8 @@
 
 /** Fixed-capacity packet slot pool with explicit ownership.
  *
- * The pool owns one preallocated device buffer of `T_SlotCapacity` slots,
- * each `T_ElementCapacity` bytes of element storage wide. It hands out slot
+ * The pool owns one preallocated device buffer of `T_SlotCapacity` slots, each
+ * `T_ElementCapacity` bytes of element storage wide. It hands out slot
  * ownership with `acquire()`/`release()`; a `PacketHandle` names a slot plus
  * the generation the pool had when it handed the slot out, so a stale handle
  * that still names the index is detectable instead of silently observing a
@@ -29,11 +29,11 @@
  * These are separate events and the API keeps them separate:
  *
  * - The ready ring reuses a *ring slot* when the entry it carries has been
- *   claimed. The ring stamp advances and the ring slot is writable again;
- *   the packet the entry named is untouched.
- * - The packet pool reuses a *packet slot* when its owner calls
- *   `release()`. The pool increments the slot's generation and the slot is
- *   acquirable again; the ring is untouched.
+ *   claimed. The ring stamp advances and the ring slot is writable again; the
+ *   packet the entry named is untouched.
+ * - The packet pool reuses a *packet slot* when its owner calls `release()`.
+ *   The pool increments the slot's generation and the slot is acquirable
+ *   again; the ring is untouched.
  *
  * A job that reads a packet must keep its handle until the last read
  * completes; releasing earlier is a use-after-release that the generation
@@ -49,37 +49,28 @@
  *
  * where
  *
- * - `P` is the live-particle admission limit: each ordinary detached
- *   nonempty packet can be charged to a distinct admitted particle, so at
- *   most `P` slots are live particle data.
- * - `B` is the number of assembly streams (Bin 0, Bin 1, and the common
- *   feedback input in the required example). Each stream keeps two physical
+ * - `P` is the live-particle admission limit: each ordinary detached nonempty
+ *   packet can be charged to a distinct admitted particle, so at most `P`
+ *   slots carry live particle data.
+ * - `B` is the number of assembly streams. Each stream keeps two physical
  *   output chunks (`A`, `B`), so `2*B` slots.
  * - `W` is the number of concurrent workers and `R` is the maximum number of
  *   detached replacement or scratch packets one worker may hold at once, so
- *   `W*R` slots for temporary allocations and copied-but-uncommitted
- *   packets.
- * - `S` is the control/source allowance: slots for control packets and
- *   source request staging that do not carry admitted particles.
+ *   `W*R` slots for temporary allocations and copied-but-uncommitted packets.
+ * - `S` is the control/source allowance: slots for control packets and source
+ *   request staging that do not carry admitted particles.
  *
  * `PacketPool::configure()` verifies at startup that the configured
  * `T_SlotCapacity` satisfies the formula for the requested budget and fails
- * loudly (records a violation, exposes it through `ownershipViolations()`,
- * and leaves no slot acquirable) when it does not. There is no silent
- * clamping.
- *
- * The example values used by the required particle-feedback example are
- * parameters, not magic numbers; the tests instantiate the pool with small
- * values of each.
+ * loudly (records a violation, exposes it through `ownershipViolations()`, and
+ * leaves no slot acquirable) when it does not. There is no silent clamping.
  *
  * # Storage
  *
- * No allocation after startup. All storage comes from a
- * caller-provided device buffer (an alpaka buffer) so the pool can be
- * preallocated before the persistent launch. The host calls
- * `PacketPool::storageBytes()` to size the buffer, allocates it, and hands
- * the pointer to the startup action of the persistent kernel, which calls
- * `configure()`.
+ * No allocation after startup. All storage comes from a caller-provided device
+ * buffer (an alpaka buffer) so the pool can be preallocated before the
+ * persistent launch. The host sizes the buffer with `storageBytes()`, allocates
+ * it, and hands the pointer to the startup action, which calls `configure()`.
  */
 namespace graph
 {
@@ -92,10 +83,9 @@ namespace graph
     /** One slot's bookkeeping, kept alongside the pool's slot array.
      *
      * `generation` starts at zero and increments on every reuse (that is, on
-     * every successful `release()` that returns the slot to the free list),
-     * so a handle whose generation does not match the slot's current
-     * generation names a slot that has been reused. The pool records an
-     * ownership violation for such a mismatch (see
+     * every successful `release()`), so a handle whose generation does not
+     * match the slot's current generation names a slot that has been reused.
+     * The pool records an ownership violation for such a mismatch (see
      * `PacketPool::ownershipViolations()`).
      *
      * `active` is set while a slot is held and cleared on release; a release
@@ -151,24 +141,19 @@ namespace graph
         return requiredSlots(b.liveParticles, b.assemblyStreams, b.workers, b.replacementsPerWorker, b.controlAllowance);
     }
 
-    namespace detail
+    namespace pool_detail
     {
-        /** Device-scope release fence: the stores issued before it become
-         *  visible to any warp that performs the matching acquire fence after
-         *  observing the lock release. Shared with the ready ring: the pool
-         *  and the ring use the same publication protocol. */
+        /** Round `value` up to a multiple of `alignment` (both powers of two). */
+        constexpr std::size_t alignUp(std::size_t value, std::size_t alignment) noexcept
+        {
+            return (value + alignment - 1u) & ~(alignment - 1u);
+        }
+
+        /** Device-scope release fence. */
         template<typename T_Acc>
         ALPAKA_FN_ACC constexpr void publishRelease(T_Acc const& acc) noexcept
         {
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
-        }
-
-        /** Warp-level lane rendezvous (not a memory barrier): maps to the
-         *  warp primitive `all(true)`, the width-one identity on the host. */
-        template<typename T_Acc>
-        ALPAKA_FN_ACC constexpr void warpRendezvous(WarpGroup<T_Acc> const& warp) noexcept
-        {
-            (void)warp.all(true);
         }
 
         /** Device-scope atomic compare-exchange on a naturally aligned word. */
@@ -177,7 +162,7 @@ namespace graph
         {
             return alpaka::onAcc::atomicCas(acc, addr, expected, desired, alpaka::onAcc::scope::device);
         }
-    } // namespace detail
+    } // namespace pool_detail
 
     /** Fixed-capacity packet slot pool over preallocated device storage.
      *
@@ -185,12 +170,12 @@ namespace graph
      * physical element storage of each slot in bytes. Both are compile time.
      *
      * All public methods are device-side (`ALPAKA_FN_ACC`) and warp-uniform:
-     * every active lane of the calling warp must call the same method with
-     * the same arguments, and only the lane selected by
-     * `WarpGroup::isLeader()` performs the locked work.
+     * every active lane of the calling warp must call the same method with the
+     * same arguments, and only the lane selected by `WarpGroup::isLeader()`
+     * performs the locked work.
      *
-     * The pool is a view over preallocated storage: it performs no
-     * allocation and never outlives the storage it references.
+     * The pool is a view over preallocated storage: it performs no allocation
+     * and never outlives the storage it references.
      */
     template<typename T_Acc, std::size_t T_SlotCapacity = 1024u, std::size_t T_ElementCapacity = 4096u>
     class PacketPool
@@ -206,8 +191,8 @@ namespace graph
 
         /** One slot: the element storage plus the per-slot bookkeeping.
          *
-         * The pool is element-type-agnostic: the storage is raw bytes and
-         * the typed views are reconstructed through the vocabulary
+         * The pool is element-type-agnostic: the storage is raw bytes and the
+         * typed views are reconstructed through the vocabulary
          * (`PacketRecord` schema + `makePacketView`).
          *
          * Free-list encoding: while a slot is free, its `record.handle.index`
@@ -227,8 +212,7 @@ namespace graph
         static_assert(std::is_trivially_copyable_v<PoolSlot>);
         static_assert(std::is_standard_layout_v<PoolSlot>);
 
-        /** Pool header. Each word owns its own 64-byte cache line so the
-         *  contended `lock` word does not false-share with the counters. */
+        /** Pool header. Each word owns its own 64-byte cache line. */
         struct PoolHeader
         {
             std::uint32_t lock{0u};
@@ -243,19 +227,14 @@ namespace graph
 
         static_assert(std::is_trivially_copyable_v<PoolHeader>);
         static_assert(std::is_standard_layout_v<PoolHeader>);
-        static_assert(sizeof(PoolHeader) == 256u, "header layout is cache-line separated");
 
-        /** Bytes per slot and total storage size in bytes. */
+        static constexpr std::size_t headerBytes = pool_detail::alignUp(sizeof(PoolHeader), 64u);
         static constexpr std::size_t slotBytes = sizeof(PoolSlot);
-        static constexpr std::size_t storageBytes = sizeof(PoolHeader) + T_SlotCapacity * slotBytes;
+        static constexpr std::size_t storageBytes = headerBytes + T_SlotCapacity * slotBytes;
 
         /** Construct a view over preallocated device storage of at least
-         *  `storageBytes` bytes.
-         *
-         * The storage must stay valid and exclusively owned by this pool for
-         * its lifetime. Call `configure()` once (device side, startup
-         * action) before the first `acquire()`.
-         */
+         *  `storageBytes` bytes. The storage must stay valid and exclusively
+         *  owned by this pool for its lifetime. */
         ALPAKA_FN_ACC constexpr explicit PacketPool(void* storage) noexcept : m_storage(static_cast<char*>(storage))
         {
         }
@@ -263,12 +242,10 @@ namespace graph
         /** Initialize the pool for the given budget.
          *
          * The configured `T_SlotCapacity` must satisfy
-         * `requiredSlots(budget)`; when it does not, the call fails loudly:
-         * it records a violation (visible through `ownershipViolations()`),
+         * `requiredSlots(budget)`; when it does not, the call fails loudly: it
+         * records a violation (visible through `ownershipViolations()`),
          * leaves no slot acquirable, and returns false. There is no silent
-         * clamping.
-         *
-         * All lanes must call it warp-uniformly; only the leader writes.
+         * clamping. All lanes call it warp-uniformly; only the leader writes.
          * Returns `true` on success.
          */
         ALPAKA_FN_ACC constexpr bool configure(Acc const& acc, WarpGroup<Acc> const& warp, PacketPoolBudget const& budget)
@@ -285,13 +262,13 @@ namespace graph
                     slotAt(i).meta.generation = 0u;
                     slotAt(i).meta.active = 0u;
                 }
-                if(requiredSlots(budget) > T_SlotCapacity)
+                if(requiredSlots(budget) > static_cast<std::uint32_t>(T_SlotCapacity))
                 {
                     hdr->lock = 0u;
                     hdr->freeListHead = invalidSlotIndex;
                     hdr->freeCount = 0u;
                     hdr->violations = 1u;
-                    detail::publishRelease(acc);
+                    pool_detail::publishRelease(acc);
                     ok = false;
                 }
                 else
@@ -313,10 +290,9 @@ namespace graph
                         slot->record.capacity = static_cast<std::uint32_t>(T_ElementCapacity);
                         slot->record.schema = ElementSchema{};
                     }
-                    detail::publishRelease(acc);
+                    pool_detail::publishRelease(acc);
                 }
             }
-            detail::warpRendezvous(warp);
             auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
             return warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
         }
@@ -326,10 +302,10 @@ namespace graph
          * Warp-uniform. On success, `out` holds the handle (index plus the
          * slot's new generation) and the slot's `record` is reset so the
          * caller fills in its schema and element count. The leader performs
-         * the locked work; the other lanes rendezvous before and after.
+         * the locked work and the result is broadcast.
          *
-         * Returns `true` on success, `false` when no slot is free or the
-         * pool is locked.
+         * Returns `true` on success, `false` when no slot is free or the pool
+         * is locked.
          */
         ALPAKA_FN_ACC constexpr bool acquire(Acc const& acc, WarpGroup<Acc> const& warp, PacketHandle& out) noexcept
         {
@@ -364,7 +340,7 @@ namespace graph
                         // Publish the record before publishing the free-list
                         // advance, so a concurrent acquirer that observes the
                         // new head also observes the popped slot's new state.
-                        detail::publishRelease(acc);
+                        pool_detail::publishRelease(acc);
                         hdr->freeListHead = nextFree;
                         hdr->freeCount -= 1u;
                         unlock(acc);
@@ -373,13 +349,10 @@ namespace graph
                     }
                 }
             }
-            detail::warpRendezvous(warp);
             auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
             ok = warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
             if(ok)
-            {
                 broadcastHandle(warp, out);
-            }
             return ok;
         }
 
@@ -387,9 +360,9 @@ namespace graph
          *
          * Warp-uniform. The handle must name a slot the caller owns (its
          * generation must match the slot's current generation and the slot
-         * must be active). On success the slot's `meta.active` is cleared,
-         * its generation is incremented (so a stale handle no longer
-         * matches), and the slot is pushed back onto the free list.
+         * must be active). On success the slot's `meta.active` is cleared, its
+         * generation is incremented (so a stale handle no longer matches), and
+         * the slot is pushed back onto the free list.
          *
          * A release with a mismatched generation (use-after-release) or a
          * release of an inactive slot (double-release) records an ownership
@@ -430,7 +403,7 @@ namespace graph
                         slot->record.schema = ElementSchema{};
                         // Publish the slot's new free-list state before the
                         // head advances.
-                        detail::publishRelease(acc);
+                        pool_detail::publishRelease(acc);
                         hdr->freeListHead = handle.index;
                         hdr->freeCount += 1u;
                         unlock(acc);
@@ -438,19 +411,18 @@ namespace graph
                     }
                 }
             }
-            detail::warpRendezvous(warp);
             auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
             return warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
         }
 
-        /** True when `handle` names a slot the pool currently considers
-         *  owned by the caller (generation matches, slot active).
-         *
-         * This is the generation-mismatch check that makes a
-         * use-after-release detectable in test builds.
-         */
-        ALPAKA_FN_ACC constexpr bool isValid(Acc const& acc, WarpGroup<Acc> const& warp, PacketHandle const& handle)
-            const noexcept
+        /** True when `handle` names a slot the pool currently considers owned
+         *  by the caller (generation matches, slot active). This is the
+         *  generation-mismatch check that makes a use-after-release
+         *  detectable in test builds. */
+        [[nodiscard]] ALPAKA_FN_ACC constexpr bool isValid(
+            Acc const&,
+            WarpGroup<Acc> const& warp,
+            PacketHandle const& handle) const noexcept
         {
             bool valid = false;
             if(warp.isLeader())
@@ -458,27 +430,34 @@ namespace graph
                 auto const& slot = slotAt(handle.index);
                 valid = slot.meta.generation == handle.generation && slot.meta.active == 1u;
             }
-            detail::warpRendezvous(warp);
             auto const value = static_cast<std::uint32_t>(valid ? 1u : 0u);
             return warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
         }
 
-        /** Raw element pointer for a slot.
-         *
-         * The caller must hold the slot (the handle must be valid). The
-         * pointer stays valid until the slot is released and reused; the
-         * generation check is the caller's responsibility (use `isValid()` in
-         * test builds).
-         */
+        /** Raw element pointer for a slot. The caller must hold the slot
+         *  (the handle must be valid). */
         [[nodiscard]] ALPAKA_FN_ACC constexpr std::uint8_t* slotData(PacketHandle const& handle) const noexcept
         {
             return slotAt(handle.index).data;
         }
 
         /** The slot's current record (the caller must hold the slot). */
-        [[nodiscard]] ALPAKA_FN_ACC constexpr PacketRecord const& slotRecord(PacketHandle const& handle) const noexcept
+        [[nodiscard]] ALPAKA_FN_ACC constexpr PacketRecord const&
+        slotRecord(PacketHandle const& handle) const noexcept
         {
             return slotAt(handle.index).record;
+        }
+
+        /** Set the logical element count of a slot's record. The caller must
+         *  hold the slot. Publishes with a device-scope release so a consumer
+         *  that acquires the slot observes the new count. */
+        ALPAKA_FN_ACC constexpr void setElementCount(
+            Acc const& acc,
+            PacketHandle const& handle,
+            std::uint32_t count) noexcept
+        {
+            slotAt(handle.index).record.elementCount = count;
+            pool_detail::publishRelease(acc);
         }
 
         /** Reconstruct a typed view from a slot through the vocabulary.
@@ -496,19 +475,19 @@ namespace graph
         }
 
         /** Number of free slots. */
-        ALPAKA_FN_ACC constexpr std::uint64_t freeCount(Acc const& acc) const noexcept
+        [[nodiscard]] ALPAKA_FN_ACC constexpr std::uint64_t freeCount() const noexcept
         {
             return header().freeCount;
         }
 
         /** Number of slots currently held. */
-        ALPAKA_FN_ACC constexpr std::uint64_t heldCount(Acc const& acc) const noexcept
+        [[nodiscard]] ALPAKA_FN_ACC constexpr std::uint64_t heldCount() const noexcept
         {
             return T_SlotCapacity - header().freeCount;
         }
 
         /** Ownership violations recorded by the test hook. */
-        ALPAKA_FN_ACC constexpr std::uint64_t ownershipViolations(Acc const& acc) const noexcept
+        [[nodiscard]] ALPAKA_FN_ACC constexpr std::uint64_t ownershipViolations() const noexcept
         {
             return header().violations;
         }
@@ -521,20 +500,19 @@ namespace graph
 
         [[nodiscard]] ALPAKA_FN_ACC constexpr PoolSlot& slotAt(std::size_t index) const noexcept
         {
-            auto const slotsBegin = alignUp(sizeof(PoolHeader), 64u);
-            return *reinterpret_cast<PoolSlot*>(m_storage + slotsBegin + index * slotBytes);
+            return *reinterpret_cast<PoolSlot*>(m_storage + headerBytes + index * slotBytes);
         }
 
         ALPAKA_FN_ACC constexpr bool tryLock(Acc const& acc) const noexcept
         {
-            return detail::atomicCasDevice(acc, &header().lock, std::uint32_t{0u}, std::uint32_t{1u})
+            return pool_detail::atomicCasDevice(acc, &header().lock, std::uint32_t{0u}, std::uint32_t{1u})
                    == std::uint32_t{0u};
         }
 
         ALPAKA_FN_ACC constexpr void unlock(Acc const& acc) const noexcept
         {
-            detail::publishRelease(acc);
-            detail::atomicCasDevice(acc, &header().lock, std::uint32_t{1u}, std::uint32_t{0u});
+            pool_detail::publishRelease(acc);
+            pool_detail::atomicCasDevice(acc, &header().lock, std::uint32_t{1u}, std::uint32_t{0u});
         }
 
         /** Broadcast the handle from the leader to all lanes. */
@@ -550,11 +528,6 @@ namespace graph
                 handle.index = warp.template broadcast<std::uint32_t>(handle.index, 0u);
                 handle.generation = warp.template broadcast<std::uint32_t>(handle.generation, 0u);
             }
-        }
-
-        static constexpr std::size_t alignUp(std::size_t value, std::size_t alignment) noexcept
-        {
-            return (value + alignment - 1u) & ~(alignment - 1u);
         }
 
         char* m_storage;
