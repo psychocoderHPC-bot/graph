@@ -291,6 +291,12 @@ namespace graph
             std::uint64_t padViolations[7]{};
             std::uint32_t headVersion{0u};
             std::uint64_t padVersion[7]{};
+            // Diagnostic counters (test builds): CAS failure and meta-check
+            // counts. Zero in steady state; nonzero indicates a protocol bug.
+            std::uint64_t casFailures{0u};
+            std::uint64_t padCasFail[7]{};
+            std::uint64_t metaChecks{0u};
+            std::uint64_t padMeta[7]{};
         };
 
         static_assert(std::is_trivially_copyable_v<PoolHeader>);
@@ -540,19 +546,23 @@ namespace graph
             if(index >= static_cast<std::uint32_t>(T_SlotCapacity))
                 return false;
             auto* slot = &slotAt(index);
+            // Acquire: order the slot reads below against the release that
+            // preceded the head advance that made this slot visible.
+            pool_detail::claimAcquire(acc);
+            // Diagnostic: count meta checks. A slot at the head must be free
+            // (active == 0, generation matching the handle). If it is not,
+            // the free list is corrupted.
+            (void) pool_detail::atomicAddDevice(acc, &hdr->metaChecks, std::uint64_t{1u});
             // The successor is encoded in the slot's free-list field; it is
             // stable while this slot is at the head (only a push of this
             // slot can change it, and a push requires a release, which
             // requires the slot to be held, which requires it off the list).
             std::uint32_t const next = slot->record.handle.index;
-            // Acquire: order the slot reads below against the release that
-            // preceded the head advance that made this slot visible.
-            pool_detail::claimAcquire(acc);
-            // Bump the generation and mark the slot active. The meta stores are
-            // safe even if the CAS below fails: the slot is either still at the
-            // head (another warp will pop it and re-set the meta) or it has been
-            // released (the release re-checks the generation and records a
-            // violation if the handle is stale).
+            // Bump the generation and mark the slot active. The meta stores
+            // are performed before the CAS: if the CAS fails, another warp
+            // moved the head and this attempt is discarded, but the meta
+            // stores are harmless (the slot is still at the head or has been
+            // released, and the next popper/release re-validates).
             slot->meta.generation += 1u;
             slot->meta.active = 1u;
             slot->record.handle.index = index;
@@ -578,10 +588,8 @@ namespace graph
                 out.generation = slot->meta.generation;
                 return true;
             }
-            // CAS failed: another warp moved the head. The meta stores above
-            // are safe: the slot is either still at the head (the next popper
-            // re-sets the meta) or it has been released (the release re-checks
-            // the generation and records a violation if the handle is stale).
+            // CAS failed: another warp moved the head.
+            (void) pool_detail::atomicAddDevice(acc, &hdr->casFailures, std::uint64_t{1u});
             return false;
         }
 
