@@ -290,27 +290,32 @@ namespace
                     }
                     acqOk++;
                     auto const gen = h.generation;
-                    // While this warp holds the slot, `out[h.index]` is zero:
-                    // the previous holder cleared it before its release, and no
-                    // other warp can acquire the slot until this warp releases.
-                    // A nonzero value here means a double hand-out.
-                    auto const prev = out[h.index];
+                    // Device-atomic exchange on the per-slot marker: this warp
+                    // now owns the slot, so the marker must be zero (the
+                    // previous holder cleared it atomically before releasing).
+                    // A nonzero return means a double hand-out.
+                    auto const marker = static_cast<std::uint64_t>(blockIndex + 1u) << 32u | gen;
+                    auto const prev = alpaka::onAcc::atomicExch(
+                        acc,
+                        &out[h.index],
+                        marker,
+                        alpaka::onAcc::scope::device);
                     if(prev != 0ull)
                     {
                         doubleOut++;
                         if(gen < (prev & 0xffff'ffffull))
                             nonMono++;
                     }
-                    out[h.index] = (static_cast<std::uint64_t>(blockIndex + 1u) << 32u) | gen;
-                    // Clear the marker BEFORE the release: once the slot is
-                    // back on the free list another warp may pop it and read
-                    // `out[h.index]` immediately, so the marker must already be
-                    // zero. The slot is still exclusive to this warp (the
-                    // release has not happened yet), so the clear is safe.
-                    out[h.index] = 0ull;
                     bool const freed = pool.release(acc, warp, h);
                     if(!freed)
                         relFail++;
+                    // Clear the marker atomically BEFORE the slot is visible
+                    // again: the next acquirer pops the slot from the free list
+                    // and exchanges its own marker, so a stale nonzero value
+                    // would be a false double hand-out. The slot is still
+                    // exclusive to this warp (release has not run yet), so the
+                    // clear cannot race with another holder.
+                    alpaka::onAcc::atomicExch(acc, &out[h.index], std::uint64_t{0u}, alpaka::onAcc::scope::device);
                 }
             }
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
