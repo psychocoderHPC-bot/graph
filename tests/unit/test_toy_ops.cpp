@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: 2026 René Widera and contributors
 // SPDX-License-Identifier: MPL-2.0
 
-// The CUDA configuration copies test sources into the build tree, so the
-// relative path to the sibling integration directory must resolve through the
-// `examples` include directory that tests/CMakeLists.txt adds to every test.
-#include "../tests/integration/toy_ops.hpp"
+// The scripted fixture lives in the sibling integration directory; the unit
+// test target adds that directory to its include path in tests/CMakeLists.txt.
+#include "toy_ops.hpp"
 
 #include <alpaka/alpaka.hpp>
 
