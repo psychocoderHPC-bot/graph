@@ -26,3 +26,12 @@ SPDX-FileCopyrightText = [
   "alpaka contributors",
 ]
 SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = [
+  "tests/reference/oracle.hpp",
+  "tests/reference/oracle.cpp",
+  "tests/reference/test-vectors.md",
+]
+SPDX-FileCopyrightText = "2026"
+SPDX-License-Identifier = "BSD-3-Clause"
