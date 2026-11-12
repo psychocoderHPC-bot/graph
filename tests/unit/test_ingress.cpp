@@ -7,9 +7,13 @@
 #include <graph/ingress_ring.hpp>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <thread>
+#include <vector>
 
 namespace
 {
@@ -72,6 +76,17 @@ namespace
     {
         return std::span<Descriptor const>{descriptors.data(), count};
     }
+
+    /** Resolver that rejects one sequence number and accepts everything else. */
+    struct RejectSequence
+    {
+        std::uint64_t rejected{0u};
+
+        ALPAKA_FN_ACC bool operator()(Descriptor const& descriptor) const noexcept
+        {
+            return descriptor.sequenceNumber != rejected;
+        }
+    };
 } // namespace
 
 TEST_CASE("ingress empty ring reports no work", "[ingress]")
@@ -450,4 +465,364 @@ TEST_CASE("ingress setCountersForTest rejects an out-of-range occupancy", "[ingr
     CHECK(ring.published() == 10u);
     CHECK(ring.consumed() == 8u);
     CHECK(ring.occupancy() == 2u);
+}
+
+TEST_CASE("ingress enqueueBlocking waits for the consumer and then accepts", "[ingress]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring<4u>::create(device);
+
+    constexpr std::uint64_t total = 8u;
+    std::array<Descriptor, 4u> first{makeDescriptor(0u), makeDescriptor(1u), makeDescriptor(2u), makeDescriptor(3u)};
+    REQUIRE(ring.tryEnqueue(asSpan(first, first.size())).accepted == 4u);
+
+    std::array<Descriptor, 4u> second{makeDescriptor(4u), makeDescriptor(5u), makeDescriptor(6u), makeDescriptor(7u)};
+
+    std::vector<Descriptor> received(total);
+    std::atomic<std::uint32_t> consumerFailed{0u};
+
+    std::thread consumer(
+        [&]
+        {
+            auto view = ring.view();
+            std::uint64_t imported = 0u;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while(imported < total && std::chrono::steady_clock::now() < deadline)
+            {
+                std::array<Descriptor, 4u> staging{};
+                auto const batch = view.pollAndImportHost(staging.data(), 4u, 2u);
+                if(batch.status == graph::ImportStatus::error)
+                {
+                    consumerFailed.store(1u);
+                    return;
+                }
+                for(std::uint32_t i = 0u; i < batch.imported; ++i)
+                {
+                    if(imported >= total || staging[i].sequenceNumber != imported)
+                    {
+                        consumerFailed.store(1u);
+                        return;
+                    }
+                    received[imported] = staging[i];
+                    ++imported;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            }
+            if(imported != total)
+                consumerFailed.store(1u);
+        });
+
+    auto const before = std::chrono::steady_clock::now();
+    auto const result = ring.enqueueBlocking(asSpan(second, second.size()), std::chrono::seconds(2));
+    auto const elapsed = std::chrono::steady_clock::now() - before;
+    consumer.join();
+
+    CHECK(result.status == graph::EnqueueStatus::accepted);
+    CHECK(result.accepted == 4u);
+    CHECK(result.requested == 4u);
+    CHECK(elapsed < std::chrono::seconds(5));
+    CHECK(consumerFailed.load() == 0u);
+    for(std::uint64_t i = 0u; i < total; ++i)
+        requireDescriptorEqual(received[i], makeDescriptor(i));
+    CHECK(ring.occupancy() == 0u);
+    CHECK(ring.consumed() == total);
+}
+
+TEST_CASE("ingress enqueueBlocking times out on a full ring without mutating it", "[ingress]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring<4u>::create(device);
+
+    std::array<Descriptor, 4u> fill{
+        makeDescriptor(10u),
+        makeDescriptor(11u),
+        makeDescriptor(12u),
+        makeDescriptor(13u)};
+    REQUIRE(ring.tryEnqueue(asSpan(fill, fill.size())).accepted == 4u);
+
+    std::array<Descriptor, 2u> extra{makeDescriptor(20u), makeDescriptor(21u)};
+    auto const before = std::chrono::steady_clock::now();
+    auto const result = ring.enqueueBlocking(asSpan(extra, extra.size()), std::chrono::milliseconds(25));
+    auto const elapsed = std::chrono::steady_clock::now() - before;
+
+    CHECK(result.status == graph::EnqueueStatus::ring_full);
+    CHECK(result.accepted == 0u);
+    CHECK(result.requested == 2u);
+    CHECK(ring.published() == 4u);
+    CHECK(ring.occupancy() == 4u);
+    // The timeout is honoured: the call waited but terminated on its own.
+    CHECK(elapsed >= std::chrono::milliseconds(20));
+    CHECK(elapsed < std::chrono::seconds(10));
+    for(std::size_t i = 0u; i < fill.size(); ++i)
+        requireDescriptorEqual(*ring.descriptorSlot(static_cast<std::uint64_t>(i)), fill[i]);
+}
+
+TEST_CASE("ingress enqueueBlocking reports a truthful partial accept on timeout", "[ingress]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring<4u>::create(device);
+
+    std::array<Descriptor, 2u> fill{makeDescriptor(0u), makeDescriptor(1u)};
+    REQUIRE(ring.tryEnqueue(asSpan(fill, fill.size())).accepted == 2u);
+
+    std::array<Descriptor, 4u> offered{makeDescriptor(2u), makeDescriptor(3u), makeDescriptor(4u), makeDescriptor(5u)};
+    auto const result = ring.enqueueBlocking(asSpan(offered, offered.size()), std::chrono::milliseconds(25));
+
+    CHECK(result.status == graph::EnqueueStatus::ring_full);
+    CHECK(result.accepted == 2u);
+    CHECK(result.requested == 4u);
+    CHECK(ring.published() == 4u);
+    CHECK(ring.occupancy() == 4u);
+
+    std::array<Descriptor, 4u> staging{};
+    auto const batch = ring.view().pollAndImportHost(staging.data(), 4u, 4u);
+    REQUIRE(batch.imported == 4u);
+    for(std::size_t i = 0u; i < fill.size(); ++i)
+        requireDescriptorEqual(staging[i], fill[i]);
+    requireDescriptorEqual(staging[2], offered[0]);
+    requireDescriptorEqual(staging[3], offered[1]);
+    CHECK(ring.occupancy() == 0u);
+}
+
+TEST_CASE("ingress requestStop terminates a blocked enqueueBlocking as closed", "[ingress]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring<4u>::create(device);
+
+    std::array<Descriptor, 4u> fill{makeDescriptor(0u), makeDescriptor(1u), makeDescriptor(2u), makeDescriptor(3u)};
+    REQUIRE(ring.tryEnqueue(asSpan(fill, fill.size())).accepted == 4u);
+
+    std::array<Descriptor, 2u> blocked{makeDescriptor(4u), makeDescriptor(5u)};
+    graph::EnqueueResult blockedResult;
+    std::thread producer(
+        [&] { blockedResult = ring.enqueueBlocking(asSpan(blocked, blocked.size()), std::chrono::seconds(1)); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Documented exception to the single-mutator rule: requestStop only stores
+    // the close flag, which the producer never writes.
+    ring.requestStop();
+    producer.join();
+
+    CHECK(blockedResult.status == graph::EnqueueStatus::closed);
+    CHECK(blockedResult.accepted == 0u);
+    CHECK(blockedResult.requested == 2u);
+    CHECK(ring.isClosed());
+    CHECK(ring.published() == 4u);
+
+    // Already-published descriptors stay importable: the ring is not wedged.
+    std::array<Descriptor, 4u> staging{};
+    auto const batch = ring.view().pollAndImportHost(staging.data(), 4u, 4u);
+    REQUIRE(batch.imported == 4u);
+    for(std::size_t i = 0u; i < fill.size(); ++i)
+        requireDescriptorEqual(staging[i], fill[i]);
+    CHECK(ring.view().pollAndImportHost(staging.data(), 4u, 4u).status == graph::ImportStatus::nothing_new);
+    CHECK(
+        ring.enqueueBlocking(asSpan(blocked, blocked.size()), std::chrono::milliseconds(0)).status
+        == graph::EnqueueStatus::closed);
+}
+
+TEST_CASE("ingress enqueueBlocking on a closed ring returns closed without waiting", "[ingress]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring<4u>::create(device);
+
+    auto job = makeDescriptor(0u);
+    REQUIRE(ring.tryEnqueue(std::span<Descriptor const>{&job, 1u}).accepted == 1u);
+    REQUIRE(ring.closeInput().status == graph::EnqueueStatus::accepted);
+
+    std::array<Descriptor, 2u> offered{makeDescriptor(1u), makeDescriptor(2u)};
+    auto const publishedBefore = ring.published();
+
+    std::span<Descriptor const> const empty{};
+    auto const emptyResult = ring.enqueueBlocking(empty, std::chrono::seconds(1));
+    CHECK(emptyResult.status == graph::EnqueueStatus::closed);
+    CHECK(emptyResult.accepted == 0u);
+
+    auto const before = std::chrono::steady_clock::now();
+    auto const result = ring.enqueueBlocking(asSpan(offered, offered.size()), std::chrono::seconds(1));
+    auto const elapsed = std::chrono::steady_clock::now() - before;
+
+    CHECK(result.status == graph::EnqueueStatus::closed);
+    CHECK(result.accepted == 0u);
+    CHECK(result.requested == 2u);
+    CHECK(ring.published() == publishedBefore);
+    CHECK(elapsed < std::chrono::milliseconds(500));
+}
+
+TEST_CASE("ingress concurrent host producer and host importer keep order and exactly-once", "[ingress]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring<8u>::create(device);
+
+    constexpr std::uint64_t messageCount = 4096u;
+    std::vector<Descriptor> received(messageCount + 1u);
+    std::atomic<std::uint32_t> producerFailed{0u};
+    std::atomic<std::uint32_t> consumerFailed{0u};
+    // Capacity is far below the message count, so the producer must observe a
+    // full ring and wait for the importer: that is the concurrency evidence.
+    std::atomic<std::uint32_t> backpressure{0u};
+
+    std::thread producer(
+        [&]
+        {
+            for(std::uint64_t sequence = 0u; sequence < messageCount; ++sequence)
+            {
+                Descriptor const descriptor = makeDescriptor(sequence);
+                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                for(;;)
+                {
+                    auto const result = ring.tryEnqueue(std::span<Descriptor const>{&descriptor, 1u});
+                    if(result.status == graph::EnqueueStatus::accepted)
+                        break;
+                    if(result.status == graph::EnqueueStatus::ring_full)
+                        backpressure.fetch_add(1u);
+                    if(result.status == graph::EnqueueStatus::closed || result.status == graph::EnqueueStatus::error
+                       || std::chrono::steady_clock::now() >= deadline)
+                    {
+                        producerFailed.store(1u);
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+            }
+            auto const closeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            for(;;)
+            {
+                auto const result = ring.closeInput();
+                if(result.status == graph::EnqueueStatus::accepted)
+                    return;
+                if(result.status == graph::EnqueueStatus::error || std::chrono::steady_clock::now() >= closeDeadline)
+                {
+                    producerFailed.store(1u);
+                    return;
+                }
+                std::this_thread::yield();
+            }
+        });
+
+    std::thread consumer(
+        [&]
+        {
+            auto view = ring.view();
+            std::uint64_t expected = 0u;
+            std::uint64_t lastConsumed = 0u;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+            for(;;)
+            {
+                std::array<Descriptor, 8u> staging{};
+                auto const batch = view.pollAndImportHost(staging.data(), 8u, 4u);
+                if(batch.status == graph::ImportStatus::error)
+                {
+                    consumerFailed.store(1u);
+                    return;
+                }
+                for(std::uint32_t i = 0u; i < batch.imported; ++i)
+                {
+                    if(staging[i].kind == graph::JobKind::END_OF_INPUT)
+                    {
+                        // The marker carries no user sequence number; it must be
+                        // the last descriptor of the batch and of the stream.
+                        if(expected != messageCount || i + 1u != batch.imported)
+                        {
+                            consumerFailed.store(1u);
+                            return;
+                        }
+                        received[messageCount] = staging[i];
+                        ++expected;
+                        continue;
+                    }
+                    if(expected >= messageCount || staging[i].sequenceNumber != expected)
+                    {
+                        consumerFailed.store(1u);
+                        return;
+                    }
+                    received[expected] = staging[i];
+                    ++expected;
+                }
+
+                // Single consumer: consumed must advance monotonically. Compare
+                // modular deltas, never absolute magnitudes.
+                std::uint64_t const consumed = ring.consumed();
+                if(consumed - lastConsumed > 8u)
+                {
+                    consumerFailed.store(1u);
+                    return;
+                }
+                lastConsumed = consumed;
+
+                if(batch.endMarkerSeen)
+                    break;
+                if(std::chrono::steady_clock::now() >= deadline)
+                {
+                    consumerFailed.store(1u);
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            if(expected != messageCount + 1u)
+                consumerFailed.store(1u);
+        });
+
+    producer.join();
+    consumer.join();
+
+    CHECK(producerFailed.load() == 0u);
+    CHECK(consumerFailed.load() == 0u);
+    CHECK(backpressure.load() > 0u);
+    for(std::uint64_t sequence = 0u; sequence < messageCount; ++sequence)
+        requireDescriptorEqual(received[sequence], makeDescriptor(sequence));
+    CHECK(received[messageCount].kind == graph::JobKind::END_OF_INPUT);
+
+    auto const counters = ring.debugCounters();
+    CHECK(counters.published == messageCount + 1u);
+    CHECK(counters.consumed == messageCount + 1u);
+    CHECK(counters.totalEnqueued == messageCount + 1u);
+    CHECK(counters.totalImported == messageCount + 1u);
+    CHECK(counters.occupancy == 0u);
+    CHECK(counters.closed);
+    CHECK(counters.importError == graph::IngressError::none);
+}
+
+TEST_CASE("ingress import error acknowledges nothing and does not poison the ring", "[ingress]")
+{
+    auto device = makeTestDevice();
+    auto ring = Ring<4u>::create(device);
+
+    std::array<Descriptor, 3u> jobs{makeDescriptor(0u), makeDescriptor(1u), makeDescriptor(2u)};
+    REQUIRE(ring.tryEnqueue(asSpan(jobs, jobs.size())).accepted == 3u);
+
+    std::array<Descriptor, 4u> staging{};
+    auto const rejected = ring.view().pollAndImportHost(staging.data(), 4u, 4u, RejectSequence{1u});
+    CHECK(rejected.status == graph::ImportStatus::error);
+    CHECK(rejected.error == graph::IngressError::invalid_descriptor);
+    CHECK(rejected.imported == 0u);
+    CHECK(rejected.jobCount == 0u);
+    CHECK_FALSE(rejected.endMarkerSeen);
+
+    // Nothing acknowledged: the rejected descriptor and its predecessor stay in
+    // the ring and `consumed` does not pass them.
+    CHECK(ring.consumed() == 0u);
+    CHECK(ring.published() == 3u);
+    CHECK(ring.occupancy() == 3u);
+    CHECK(ring.debugCounters().totalImported == 0u);
+    CHECK(ring.debugCounters().importError == graph::IngressError::invalid_descriptor);
+    CHECK(ring.descriptorSlot(1u)->sequenceNumber == 1u);
+
+    // Not poisoned: the same descriptors import once the resolver accepts them.
+    auto const accepted = ring.view().pollAndImportHost(staging.data(), 4u, 4u);
+    REQUIRE(accepted.status == graph::ImportStatus::imported);
+    REQUIRE(accepted.imported == 3u);
+    for(std::size_t i = 0u; i < jobs.size(); ++i)
+        requireDescriptorEqual(staging[i], jobs[i]);
+    CHECK(ring.consumed() == 3u);
+    CHECK(ring.debugCounters().totalImported == 3u);
+    // The error code is sticky, so the host can still observe it afterwards.
+    CHECK(ring.debugCounters().importError == graph::IngressError::invalid_descriptor);
+
+    // And the ring is still fully usable.
+    auto const extra = makeDescriptor(3u);
+    CHECK(ring.tryEnqueue(std::span<Descriptor const>{&extra, 1u}).status == graph::EnqueueStatus::accepted);
+    REQUIRE(ring.view().pollAndImportHost(staging.data(), 4u, 4u).imported == 1u);
+    requireDescriptorEqual(staging[0], extra);
+    CHECK(ring.occupancy() == 0u);
 }
