@@ -6,6 +6,12 @@ include(FetchContent)
 # Drive alpaka's own configuration from the graph options before alpaka is
 # configured, whether it is fetched or added from a local checkout.
 set(alpaka_DEP_CUDA ${GRAPH_ENABLE_CUDA} CACHE BOOL "Enable the CUDA dependency" FORCE)
+if(GRAPH_ENABLE_CUDA)
+    # The tests and the particle kernel are compiled against the CUDA API
+    # directly (alpaka::exec::gpuCuda), so the execution backend must be
+    # enabled even though alpaka itself is a header-only interface here.
+    set(alpaka_EXEC_GPU_CUDA ON CACHE BOOL "Enable the CUDA execution backend" FORCE)
+endif()
 set(alpaka_DEP_OMP ${GRAPH_ENABLE_OPENMP} CACHE BOOL "Enable the OpenMP dependency" FORCE)
 set(alpaka_DEP_TBB OFF CACHE BOOL "Enable the oneTBB dependency" FORCE)
 set(alpaka_DEP_HIP OFF CACHE BOOL "Enable the HIP dependency" FORCE)
