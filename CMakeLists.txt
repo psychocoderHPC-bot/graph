@@ -30,3 +30,6 @@ if(BUILD_TESTING)
 endif()
 
 add_subdirectory(examples)
+
+# Device-function-pointer ABI probe (CUDA-only target inside).
+add_subdirectory(probes)
