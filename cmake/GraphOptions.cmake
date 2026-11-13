@@ -19,6 +19,17 @@ if(GRAPH_ENABLE_OPENMP AND NOT OpenMP_CXX_FOUND)
     message(WARNING "GRAPH_ENABLE_OPENMP is ON but no OpenMP C++ support was found; disabling OpenMP.")
     set(GRAPH_ENABLE_OPENMP OFF CACHE BOOL "Enable the OpenMP CPU executor if OpenMP is available" FORCE)
 endif()
+# Compile-time gate of the warp barrier divergence diagnostics. Default on:
+# the detection, the counter, and the diagnostic skip are compiled in and the
+# runtime PoolConfig flags select whether a given launch runs them. A build
+# that sets this to OFF removes the check entirely and must not be cited as
+# evidence that no divergence exists; a validated run is a run with the
+# diagnostics enabled and a divergence count of zero.
+option(
+    GRAPH_ENABLE_BARRIER_DIVERGENCE_DIAGNOSTICS
+    "Compile the warp barrier divergence diagnostics (detection, counter, skip)"
+    ON
+)
 
 set(
     GRAPH_ALPAKA_SOURCE_DIR

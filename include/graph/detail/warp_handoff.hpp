@@ -5,9 +5,12 @@
 
 #include <alpaka/alpaka.hpp>
 
+#include <graph/detail/barrier_diagnostics.hpp>
+#include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <type_traits>
 
 /** Block-shared handoff of one warp-uniform value.
@@ -42,10 +45,13 @@
  *   lane of the block calls it on the same line.
  * - **Who reads**: every lane of the block, after `sync()`, through `get()`.
  *
- * `syncBlockThreads` is used deliberately instead of `WarpBarrier`: the slot is
- * *block* shared memory, so an ordering primitive that covers the whole block
- * is exactly what the storage needs. The pool runs one warp per block, where a
- * block barrier is a warp barrier (see `warp_barrier.hpp`).
+ * `syncBlockThreads` is the primitive, reached through `WarpBarrier`: the slot
+ * is *block* shared memory, so an ordering primitive that covers the whole
+ * block is exactly what the storage needs. The pool runs one warp per block,
+ * where a block barrier is a warp barrier (see `warp_barrier.hpp`). Routing the
+ * sync through the barrier also subjects the handoff's call site to the
+ * barrier divergence diagnostic, so a handoff reached divergent is named the
+ * same way a `WarpBarrier` call site is.
  *
  * Width-one accelerators (the host backend) keep the value in the handoff
  * object: the single lane is the leader, and the broadcast is the identity.
@@ -72,6 +78,13 @@ namespace graph
 
         static constexpr std::uint32_t compileTimeWarpSize = WarpGroup<Acc>::compileTimeWarpSize;
 
+        ALPAKA_FN_ACC constexpr WarpHandoff() noexcept = default;
+
+        ALPAKA_FN_ACC constexpr explicit WarpHandoff(WarpBarrierDiagnostics<Acc> const& diagnostics) noexcept
+            : m_diagnostics(diagnostics)
+        {
+        }
+
         /** Publish `value` for the block. Only lane 0 writes. */
         ALPAKA_FN_ACC constexpr void publish(Acc const& acc, WarpGroup<Acc> const& warp, Value const& value) noexcept
         {
@@ -90,13 +103,26 @@ namespace graph
 
         /** Order the writer's publication against every lane's `get()`.
          *
-         * Every lane of the block must call this on the same line. */
-        ALPAKA_FN_ACC constexpr void sync(Acc const& acc) const noexcept
+         * Every lane of the block must call this on the same line. The block
+         * width equals the warp width in the sanctioned layout, so it is
+         * passed to the barrier, which also runs the divergence diagnostic.
+         * `barrierId` identifies the handoff call site; it derives from the
+         * slot id so two distinct handoffs report distinct ids.
+         */
+        ALPAKA_FN_ACC constexpr void sync(Acc const& acc, std::uint32_t barrierId) const noexcept
         {
             if constexpr(compileTimeWarpSize == 1u)
+            {
                 (void) acc;
+                (void) barrierId;
+            }
             else
-                alpaka::onAcc::syncBlockThreads(acc);
+            {
+                auto const blockThreads = static_cast<std::uint32_t>(
+                    acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+                WarpBarrier<Acc> const barrier{m_diagnostics};
+                barrier.barrier(acc, blockThreads, WarpGroup<Acc>{acc}, barrierId, ~std::uint32_t{0u}, 0u);
+            }
         }
 
         /** Read the published value. Valid after `sync()`. */
@@ -126,6 +152,7 @@ namespace graph
 
         /** Width-one fallback: the single lane is the leader. */
         Value m_local{};
+        WarpBarrierDiagnostics<Acc> m_diagnostics{};
     };
 
     /** Slot ids of the pool handoffs.

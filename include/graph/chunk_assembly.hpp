@@ -5,6 +5,7 @@
 
 #include <alpaka/alpaka.hpp>
 
+#include <graph/detail/barrier_diagnostics.hpp>
 #include <graph/detail/concepts.hpp>
 #include <graph/detail/packet.hpp>
 #include <graph/detail/stream_id.hpp>
@@ -336,7 +337,8 @@ namespace graph
             std::uint32_t index,
             StreamId id,
             ChunkSlot<T> first,
-            ChunkSlot<T> second) noexcept
+            ChunkSlot<T> second,
+            WarpBarrierDiagnostics<T_Acc> const& diagnostics = {}) noexcept
         {
             bool ok = false;
             if(warp.isLeader())
@@ -367,8 +369,8 @@ namespace graph
             // not reconverge them, so synchronize before the broadcast.
             auto const blockThreads = static_cast<std::uint32_t>(
                 acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
-            WarpBarrier<T_Acc> convergence{};
-            convergence.barrier(acc, blockThreads, warp);
+            WarpBarrier<T_Acc> convergence{diagnostics};
+            convergence.barrier(acc, blockThreads, warp, barrier_id::assemblyInitialize, ~std::uint32_t{0u}, 0u);
             return broadcastBool(warp, ok);
         }
 
@@ -418,7 +420,8 @@ namespace graph
             std::uint32_t index,
             std::uint32_t ownerToken,
             ChunkSlot<T> replacement,
-            ChunkSlot<T>& published) noexcept
+            ChunkSlot<T>& published,
+            WarpBarrierDiagnostics<T_Acc> const& diagnostics = {}) noexcept
         {
             std::uint32_t status = static_cast<std::uint32_t>(FlushStatus::InvalidStream);
             ChunkSlot<T> result{};
@@ -430,8 +433,8 @@ namespace graph
             // descriptor below. The release fence after the barrier then
             // orders the leader's own metadata publication after the ordered
             // element writes.
-            WarpBarrier<T_Acc> barrier{};
-            barrier.barrier(acc, blockThreads, warp);
+            WarpBarrier<T_Acc> barrier{diagnostics};
+            barrier.barrier(acc, blockThreads, warp, barrier_id::assemblyFlush, ~std::uint32_t{0u}, 0u);
             if(warp.isLeader())
             {
                 if(validStreamIndex(index) && ownerToken != 0u)
@@ -465,8 +468,14 @@ namespace graph
             // Reconverge after the leader-only claim/apply region before any
             // shuffle distributes the result.
             {
-                WarpBarrier<T_Acc> convergence{};
-                convergence.barrier(acc, blockThreads, warp);
+                WarpBarrier<T_Acc> convergence{diagnostics};
+                convergence.barrier(
+                    acc,
+                    blockThreads,
+                    warp,
+                    barrier_id::assemblyFlushConverge,
+                    ~std::uint32_t{0u},
+                    0u);
             }
             status = warp.template broadcast<std::uint32_t>(status, 0u);
             result.slot = warp.template broadcast<std::uint32_t>(result.slot, 0u);
@@ -636,7 +645,8 @@ namespace graph
             ChunkSlot<T> const* replacements,
             std::uint32_t replacementCount,
             ChunkSlot<T>* publications,
-            std::uint32_t publicationCount) noexcept
+            std::uint32_t publicationCount,
+            WarpBarrierDiagnostics<T_Acc> const& diagnostics = {}) noexcept
         {
             if(m_status == Status::Pending)
                 return AppendStatus::AlreadyPending;
@@ -662,8 +672,8 @@ namespace graph
             {
                 auto const blockThreads = static_cast<std::uint32_t>(
                     acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
-                WarpBarrier<T_Acc> convergence{};
-                convergence.barrier(acc, blockThreads, warp);
+                WarpBarrier<T_Acc> convergence{diagnostics};
+                convergence.barrier(acc, blockThreads, warp, barrier_id::assemblyReserve, ~std::uint32_t{0u}, 0u);
             }
             status = warp.template broadcast<std::uint32_t>(status, 0u);
             m_targetCount = warp.template broadcast<std::uint32_t>(m_targetCount, 0u);
@@ -762,7 +772,10 @@ namespace graph
          * `cancel()` it.
          */
         template<typename T_Acc>
-        ALPAKA_FN_ACC bool commit(T_Acc const& acc, WarpGroup<T_Acc> const& warp) noexcept
+        ALPAKA_FN_ACC bool commit(
+            T_Acc const& acc,
+            WarpGroup<T_Acc> const& warp,
+            WarpBarrierDiagnostics<T_Acc> const& diagnostics = {}) noexcept
         {
             bool ok = false;
             auto const blockThreads = static_cast<std::uint32_t>(
@@ -773,8 +786,8 @@ namespace graph
             // device-scope release fence orders only the executing thread's
             // own prior writes, so neither could publish the other lanes'
             // stores.
-            WarpBarrier<T_Acc> barrier{};
-            barrier.barrier(acc, blockThreads, warp);
+            WarpBarrier<T_Acc> barrier{diagnostics};
+            barrier.barrier(acc, blockThreads, warp, barrier_id::assemblyCommit, ~std::uint32_t{0u}, 0u);
             if(warp.isLeader())
             {
                 if(m_status == Status::Pending)
@@ -809,8 +822,14 @@ namespace graph
             // Reconverge after the leader-only apply region before the result
             // is distributed through a shuffle.
             {
-                WarpBarrier<T_Acc> convergence{};
-                convergence.barrier(acc, blockThreads, warp);
+                WarpBarrier<T_Acc> convergence{diagnostics};
+                convergence.barrier(
+                    acc,
+                    blockThreads,
+                    warp,
+                    barrier_id::assemblyCommitConverge,
+                    ~std::uint32_t{0u},
+                    0u);
             }
             ok = warp.template broadcast<std::uint32_t>(ok ? 1u : 0u, 0u) != 0u;
             m_status = static_cast<Status>(
@@ -826,7 +845,10 @@ namespace graph
          * primitive.
          */
         template<typename T_Acc>
-        ALPAKA_FN_ACC void cancel(T_Acc const& acc, WarpGroup<T_Acc> const& warp) noexcept
+        ALPAKA_FN_ACC void cancel(
+            T_Acc const& acc,
+            WarpGroup<T_Acc> const& warp,
+            WarpBarrierDiagnostics<T_Acc> const& diagnostics = {}) noexcept
         {
             if(warp.isLeader())
             {
@@ -845,8 +867,8 @@ namespace graph
             {
                 auto const blockThreads = static_cast<std::uint32_t>(
                     acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
-                WarpBarrier<T_Acc> convergence{};
-                convergence.barrier(acc, blockThreads, warp);
+                WarpBarrier<T_Acc> convergence{diagnostics};
+                convergence.barrier(acc, blockThreads, warp, barrier_id::assemblyCancel, ~std::uint32_t{0u}, 0u);
             }
             m_status = static_cast<Status>(
                 warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(m_status), 0u));

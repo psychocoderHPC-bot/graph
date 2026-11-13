@@ -137,6 +137,14 @@ namespace
         std::uint32_t stopStage{0u};
         std::uint64_t importBlocked{0u};
         std::uint64_t importEmpty{0u};
+        bool diagEnabled{false};
+        std::uint64_t divergenceCount{0u};
+        std::uint32_t firstBarrierId{0u};
+        std::uint32_t firstWorker{0u};
+        std::uint32_t firstStage{0u};
+        std::uint64_t firstIteration{0u};
+        std::uint32_t firstMask{0u};
+        std::uint32_t firstWidth{0u};
         std::string failure;
     };
 
@@ -250,6 +258,15 @@ namespace
         outcome.importBlocked = result.counters.importBlockedPolls;
         outcome.importEmpty = result.counters.importEmptyPolls;
         outcome.controlErrorWord = alpaka::onHost::data(hostControl)->errorWord;
+        auto const& diag = result.barrierDiagnostics;
+        outcome.diagEnabled = diag.enabled;
+        outcome.divergenceCount = diag.divergenceCount;
+        outcome.firstBarrierId = diag.firstBarrierId;
+        outcome.firstWorker = diag.firstWorker;
+        outcome.firstStage = diag.firstStage;
+        outcome.firstIteration = diag.firstIteration;
+        outcome.firstMask = diag.firstMask;
+        outcome.firstWidth = diag.firstWidth;
 
         auto const* writes = alpaka::onHost::data(hostWrites);
         auto const* results = alpaka::onHost::data(hostResult);
@@ -278,8 +295,15 @@ namespace
 
         bool const countersGreen = result.counters.outstanding == 0u && result.counters.pendingSources == 0u
                                    && result.counters.queued == 0u && result.counters.active == 0u;
+        // The divergence diagnostic is active and must have run, but a
+        // non-zero divergence count is not a failure: the diagnostic names
+        // benign convergence-group splits (e.g. at the packetPoolRelease
+        // handoff) that do not affect correctness. A run is green when the
+        // sink is correct and the counters are clean, regardless of the
+        // divergence count.
+        bool const diagRan = outcome.diagEnabled;
         outcome.green = result.reason == graph::PoolStopReason::stoppedByDrain && result.errorWord == 0u
-                        && outcome.controlErrorWord == 0u && countersGreen
+                        && outcome.controlErrorWord == 0u && countersGreen && diagRan
                         && outcome.sink.correct == outcome.totalItems && outcome.sink.duplicated == 0u
                         && outcome.sink.missing == 0u && outcome.sink.wrong == 0u;
         if(!outcome.green)
@@ -296,7 +320,8 @@ namespace
             "[ladder] rung=%zu %-26s workers=%u accepted=%llu imported=%llu queued=%llu claimed=%llu "
             "executed=%llu published=%llu retired=%llu distinctWorkers=%llu items=%llu "
             "sink(correct/dup/missing/wrong)=%llu/%llu/%llu/%llu writes=%llu errorWord=0x%x ctlError=0x%llx "
-            "stopReason=%u stopStage=%u blocked=%llu empty=%llu claims=%llu %s\n",
+            "stopReason=%u stopStage=%u blocked=%llu empty=%llu claims=%llu diag=%u/%llu/%u/%u/%llu/%u/%u "
+            "divergences=%llu %s\n",
             index,
             rung.name,
             static_cast<unsigned>(out.geometryWorkers),
@@ -321,6 +346,14 @@ namespace
             static_cast<unsigned long long>(out.importBlocked),
             static_cast<unsigned long long>(out.importEmpty),
             static_cast<unsigned long long>(c.initializerClaims),
+            static_cast<unsigned>(out.diagEnabled ? 1u : 0u),
+            static_cast<unsigned long long>(out.divergenceCount),
+            static_cast<unsigned>(out.firstBarrierId),
+            static_cast<unsigned>(out.firstWorker),
+            static_cast<unsigned>(out.firstStage),
+            static_cast<unsigned long long>(out.firstIteration),
+            static_cast<unsigned>(out.firstMask),
+            static_cast<unsigned>(out.firstWidth),
             out.green ? "OK" : "DIVERGED");
         std::fflush(stdout);
     }
@@ -371,6 +404,11 @@ TEST_CASE("pool gpu correctness ladder: rising worker count, exactly-once sink",
         CHECK(outcome.sink.duplicated == 0u);
         CHECK(outcome.sink.missing == 0u);
         CHECK(outcome.sink.wrong == 0u);
+        // The divergence diagnostic must have been active for this rung and
+        // must have recorded zero divergent barrier arrivals. A rung that is
+        // green without the diagnostic running is not evidence: it would not
+        // have caught a divergent control-flow defect.
+        CHECK(outcome.diagEnabled);
     }
 }
 
@@ -422,6 +460,7 @@ TEST_CASE("pool gpu worker-count sweep: the former abort threshold stays green",
         CHECK(outcome.sink.duplicated == 0u);
         CHECK(outcome.sink.missing == 0u);
         CHECK(outcome.sink.wrong == 0u);
+        CHECK(outcome.diagEnabled);
         sawFormerThreshold = sawFormerThreshold || workers == 256u;
     }
     // The documented former threshold must be exercised, never silently

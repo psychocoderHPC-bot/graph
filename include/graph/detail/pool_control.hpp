@@ -43,6 +43,18 @@
  */
 namespace graph
 {
+    /**
+     * Compile-time gate of the warp barrier divergence diagnostics.
+     *
+     * Default on. A build that defines it to 0 removes the mask query, the
+     * counter, and the skip decision entirely (see
+     * `graph/detail/barrier_diagnostics.hpp`). A validated run is a run with
+     * the diagnostics enabled and a divergence count of zero; a build with
+     * the gate off must not be cited as evidence that no divergence exists.
+     */
+    inline constexpr bool enableBarrierDivergenceDiagnostics
+        = static_cast<bool>(GRAPH_ENABLE_BARRIER_DIVERGENCE_DIAGNOSTICS);
+
     /** Compile-time capacities of the pool.
      *
      * The packet pool, ready ring, and ingress ring need compile-time
@@ -56,7 +68,9 @@ namespace graph
     inline constexpr std::size_t poolReadyCapacity = 8192u;
     inline constexpr std::uint32_t poolIngressCapacity = 256u;
     inline constexpr std::uint32_t poolStagingCapacity = 32u;
-    inline constexpr std::uint32_t poolMaxWorkers = 4096u;
+    // poolMaxWorkers is defined in config.hpp (the lowest-level header) so that
+    // headers that need a per-worker array bound can name it without pulling in
+    // this control header.
 
     /** Device error bits published in the pool error word. */
     enum class PoolError : std::uint32_t
@@ -169,6 +183,28 @@ namespace graph
          * the value only ever reduces the geometry, never raises it.
          */
         std::uint32_t testWorkerLimit{0u};
+        /**
+         * Runtime gate of the warp barrier divergence diagnostics
+         * (`graph/detail/barrier_diagnostics.hpp`). Default on: every pool
+         * run pays one warp-wide mask query per barrier call, and a divergent
+         * arrival is recorded into the launch's diagnostics state instead of
+         * deadlocking the block barrier silently. A validated run is a run
+         * with this enabled and a divergence count of zero. Setting it off
+         * restores the plain barrier with no detection.
+         */
+        bool testEnableBarrierDiagnostics{true};
+        /**
+         * Diagnostic-only: skip the barrier on a detected divergence so a
+         * test fails with the named call site instead of hanging. A skipped
+         * barrier orders no memory, so this flag must never be relied on in a
+         * validated run; it exists to make a divergent control-flow defect
+         * loud and locatable. Default on.
+         */
+        // Disabled by default: skipping a barrier changes the kernel's
+        // synchronization and can mask or amplify the defect the diagnostic
+        // is trying to name. Enable only for a controlled experiment where the
+        // skip is part of the test design, never as a default.
+        bool testBarrierSkipOnDivergence{false};
         /** Device buffer exposed through `copyResultsToHost`. */
         void* resultDevice{nullptr};
         /** Byte size of `resultDevice`. */
@@ -306,16 +342,46 @@ namespace graph
         std::uint64_t slotsReturned{0u};
         /** Non-empty partial buffers released by the drain protocol. */
         std::uint64_t drainPublications{0u};
-        /** Quiescence/drain rounds executed. */
-        std::uint64_t drainRounds{0u};
-    };
+            /** Quiescence/drain rounds executed. */
+            std::uint64_t drainRounds{0u};
+        };
 
-    /** Result of one whole pool lifetime. */
+        /** Result of one whole pool lifetime. */
     struct PoolResult
     {
+        /** Host-readable record of the barrier divergence diagnostics.
+         *
+         * Filled by the pool after the worker kernel stopped, from the
+         * launch's `BarrierDiagnosticsState`. A zero `divergenceCount` with
+         * the diagnostics enabled is the acceptance evidence that no barrier
+         * was ever reached divergent.
+         */
+        struct BarrierDiagnosticsSnapshot
+        {
+            /** Diagnostics were active for this launch (compile gate on and
+             *  the runtime flag set). */
+            bool enabled{false};
+            /** Total divergent barrier arrivals recorded. */
+            std::uint64_t divergenceCount{0u};
+            /** Barrier call-site id of the first divergence. */
+            std::uint32_t firstBarrierId{0u};
+            /** Worker (block) index of the first divergence. */
+            std::uint32_t firstWorker{0u};
+            /** Scheduler loop stage of the first divergence. */
+            std::uint32_t firstStage{0u};
+            /** Scheduling-loop iteration of the first divergence. */
+            std::uint64_t firstIteration{0u};
+            /** Active-lane mask observed at the first divergence. */
+            std::uint32_t firstMask{0u};
+            /** Warp width at the first divergence. */
+            std::uint32_t firstWidth{0u};
+        };
+
         PoolStopReason reason{PoolStopReason::neverStarted};
         std::uint32_t errorWord{0u};
         QuiescenceSnapshot counters{};
+        /** Barrier divergence diagnostics of this lifetime (see above). */
+        BarrierDiagnosticsSnapshot barrierDiagnostics{};
 
         bool stopped() const noexcept
         {

@@ -5,6 +5,7 @@
 
 #include <alpaka/alpaka.hpp>
 
+#include <graph/detail/barrier_diagnostics.hpp>
 #include <graph/detail/warp_group.hpp>
 
 #include <cstdint>
@@ -43,9 +44,45 @@
  * The barrier is invoked exactly warp-uniformly: every active lane of the
  * warp reaches the same `barrier()` call. It is never held across a lock
  * acquisition, a wait, or a callback.
+ *
+ * # Divergence diagnostics
+ *
+ * Every call site of `barrier()` carries a small integer id (a `barrier_id`
+ * constant per call site). Immediately before the block barrier,
+ * `WarpBarrierDiagnostics::observe()` compares the active-lane mask to the
+ * full mask of the warp width; a mismatch is a divergent arrival and would
+ * deadlock the block barrier. With the diagnostics enabled (the compile-time
+ * gate `GRAPH_ENABLE_BARRIER_DIVERGENCE_DIAGNOSTICS`, default on, plus the
+ * runtime `BarrierDiagnosticsConfig::enabled` flag, default on for tests) the
+ * call is recorded into the launch's `BarrierDiagnosticsState`, and with
+ * `skipOnDivergence` the barrier is skipped so the test fails with the named
+ * call site instead of hanging. The skip is diagnostic-only and never used in
+ * a validated run. A validated run is a run with the diagnostics enabled and
+ * a divergence count of zero.
  */
 namespace graph
 {
+    namespace barrier_id
+    {
+        // Call-site identities of the pool's warp barriers. The numeric value
+        // is the diagnostic's reported id; a new call site gets the next free
+        // constant so a divergence record names the site unambiguously.
+        inline constexpr std::uint32_t schedulerClaim = 1u;
+        inline constexpr std::uint32_t schedulerExecute = 2u;
+        inline constexpr std::uint32_t schedulerPublish = 3u;
+        inline constexpr std::uint32_t schedulerStartupInit = 4u;
+        inline constexpr std::uint32_t quiescenceCas = 5u;
+        inline constexpr std::uint32_t quiescenceDecision = 6u;
+        inline constexpr std::uint32_t assemblyInitialize = 7u;
+        inline constexpr std::uint32_t assemblyFlush = 8u;
+        inline constexpr std::uint32_t assemblyFlushConverge = 9u;
+        inline constexpr std::uint32_t assemblyReserve = 10u;
+        inline constexpr std::uint32_t assemblyCommit = 11u;
+        inline constexpr std::uint32_t assemblyCommitConverge = 12u;
+        inline constexpr std::uint32_t assemblyCancel = 13u;
+        inline constexpr std::uint32_t toySource = 14u;
+    } // namespace barrier_id
+
     template<typename T_Acc>
     class WarpBarrier
     {
@@ -53,6 +90,11 @@ namespace graph
         using Acc = std::remove_cvref_t<T_Acc>;
 
         ALPAKA_FN_ACC constexpr WarpBarrier() noexcept = default;
+
+        ALPAKA_FN_ACC constexpr WarpBarrier(WarpBarrierDiagnostics<Acc> const& diagnostics) noexcept
+            : m_diagnostics(diagnostics)
+        {
+        }
 
         /** True for a block that holds exactly one warp (the bring-up layout).
          *
@@ -74,22 +116,39 @@ namespace graph
          * layout, is the identity for the width-one host fallback, and refuses
          * (tripping `m_refused`) otherwise. It must not be called while the
          * caller holds any lock or is inside a wait or callback.
+         *
+         * `barrierId` identifies the call site for the divergence diagnostic;
+         * `stage`/`iteration` name the scheduler loop position when known
+         * (`~0u`/zero otherwise).
          */
-        ALPAKA_FN_ACC constexpr void barrier(Acc const& acc, std::uint32_t blockThreads, WarpGroup<Acc> const& warp)
-            const noexcept
+        ALPAKA_FN_ACC constexpr void barrier(
+            Acc const& acc,
+            std::uint32_t blockThreads,
+            WarpGroup<Acc> const& warp,
+            std::uint32_t barrierId = 0u,
+            std::uint32_t stage = ~std::uint32_t{0u},
+            std::uint64_t iteration = 0u,
+            std::uint32_t worker = 0u) const noexcept
         {
             auto const width = alpaka::onAcc::warp::getSize(acc);
             if(width <= 1u)
             {
-                // Host / single-lane warp: nothing to order.
+                // Host / single-lane warp: nothing to order, no other lane
+                // whose mask could diverge.
                 (void) acc;
                 (void) blockThreads;
                 (void) warp;
+                (void) barrierId;
+                (void) stage;
+                (void) iteration;
+                (void) worker;
                 return;
             }
             if(blockThreads == width)
             {
-                // One warp per block: a block barrier is a warp barrier.
+                bool const divergent = m_diagnostics.observe(acc, warp, width, barrierId, worker, stage, iteration);
+                if(divergent && m_diagnostics.skipOnDivergence())
+                    return;
                 alpaka::onAcc::syncBlockThreads(acc);
                 return;
             }
@@ -109,5 +168,6 @@ namespace graph
 
     private:
         mutable bool m_refused = false;
+        WarpBarrierDiagnostics<Acc> m_diagnostics{};
     };
 } // namespace graph

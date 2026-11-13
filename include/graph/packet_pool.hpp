@@ -355,7 +355,8 @@ namespace graph
         ALPAKA_FN_ACC constexpr bool configure(
             Acc const& acc,
             WarpGroup<Acc> const& warp,
-            PacketPoolBudget const& budget) noexcept
+            PacketPoolBudget const& budget,
+            WarpBarrierDiagnostics<Acc> const& diagnostics = {}) noexcept
         {
             bool ok = true;
             if(warp.isLeader())
@@ -405,9 +406,9 @@ namespace graph
                     pool_detail::publishRelease(acc);
                 }
             }
-            WarpHandoff<Acc, std::uint32_t, handoff_id::packetPoolConfigure> handoff;
+            WarpHandoff<Acc, std::uint32_t, handoff_id::packetPoolConfigure> handoff{diagnostics};
             handoff.publish(acc, warp, static_cast<std::uint32_t>(ok ? 1u : 0u));
-            handoff.sync(acc);
+            handoff.sync(acc, handoff_id::packetPoolConfigure);
             return handoff.get(acc) != 0u;
         }
 
@@ -421,9 +422,13 @@ namespace graph
          *
          * Returns `true` on success, `false` when no slot is free.
          */
-        ALPAKA_FN_ACC constexpr bool acquire(Acc const& acc, WarpGroup<Acc> const& warp, PacketHandle& out) noexcept
+        ALPAKA_FN_ACC constexpr bool acquire(
+            Acc const& acc,
+            WarpGroup<Acc> const& warp,
+            PacketHandle& out,
+            WarpBarrierDiagnostics<Acc> const& diagnostics = {}) noexcept
         {
-            WarpHandoff<Acc, Claim, handoff_id::packetPoolClaim> handoff;
+            WarpHandoff<Acc, Claim, handoff_id::packetPoolClaim> handoff{diagnostics};
             Claim claim{};
             if(warp.isLeader())
             {
@@ -432,7 +437,7 @@ namespace graph
                 claim.handle = handle;
             }
             handoff.publish(acc, warp, claim);
-            handoff.sync(acc);
+            handoff.sync(acc, handoff_id::packetPoolClaim);
             Claim const result = handoff.get(acc);
             out = result.handle;
             return result.valid != 0u;
@@ -454,14 +459,15 @@ namespace graph
         ALPAKA_FN_ACC constexpr bool release(
             Acc const& acc,
             WarpGroup<Acc> const& warp,
-            PacketHandle const& handle) noexcept
+            PacketHandle const& handle,
+            WarpBarrierDiagnostics<Acc> const& diagnostics = {}) noexcept
         {
-            WarpHandoff<Acc, std::uint32_t, handoff_id::packetPoolRelease> handoff;
+            WarpHandoff<Acc, std::uint32_t, handoff_id::packetPoolRelease> handoff{diagnostics};
             std::uint32_t ok = 0u;
             if(warp.isLeader())
                 ok = pushSlot(acc, handle) ? 1u : 0u;
             handoff.publish(acc, warp, ok);
-            handoff.sync(acc);
+            handoff.sync(acc, handoff_id::packetPoolRelease);
             return handoff.get(acc) != 0u;
         }
 

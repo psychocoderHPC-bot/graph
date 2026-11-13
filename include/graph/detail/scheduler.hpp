@@ -113,6 +113,13 @@ namespace graph
             void* assemblyStorage{nullptr};
             std::uint32_t assemblyStreamCount{0u};
             std::uint32_t assemblySlotCount{0u};
+            // Barrier divergence diagnostics (see
+            // graph/detail/barrier_diagnostics.hpp). `barrierDiagnostics` is
+            // the launch's diagnostics state; the two booleans mirror the host
+            // flags of `PoolConfig`.
+            void* barrierDiagnostics{nullptr};
+            std::uint32_t barrierDiagnosticsEnabled{0u};
+            std::uint32_t barrierSkipOnDivergence{0u};
         };
 
         static_assert(std::is_trivially_copyable_v<PoolKernelArgs>);
@@ -128,6 +135,8 @@ namespace graph
 
             Acc const& acc;
             WarpGroup<Acc> const& warp;
+            /** Divergence diagnostics shared by every barrier and handoff. */
+            WarpBarrierDiagnostics<Acc> const& diagnostics;
             WarpBarrier<Acc> const& barrier;
             Ring& ring;
             Pool& pool;
@@ -475,7 +484,7 @@ namespace graph
             constexpr std::uint32_t maxAttempts = 1u << 20u;
             for(std::uint32_t attempt = 0u; attempt < maxAttempts; ++attempt)
             {
-                if(runtime.pool.acquire(runtime.acc, runtime.warp, handle))
+                if(runtime.pool.acquire(runtime.acc, runtime.warp, handle, runtime.diagnostics))
                     return true;
                 devicePause(runtime.args.idleNanosleep);
             }
@@ -542,7 +551,7 @@ namespace graph
             RingStatus status = RingStatus::Contended;
             for(std::uint32_t attempt = 0u; attempt < maxAttempts; ++attempt)
             {
-                status = runtime.ring.enqueue(runtime.acc, runtime.warp, entry);
+                status = runtime.ring.enqueue(runtime.acc, runtime.warp, entry, runtime.diagnostics);
                 if(status != RingStatus::Contended)
                     return status;
                 if(attempt % pauseInterval == 0u)
@@ -640,7 +649,7 @@ namespace graph
         {
             for(std::uint32_t attempt = 0u; attempt < attempts; ++attempt)
             {
-                if(runtime.pool.acquire(runtime.acc, runtime.warp, handle))
+                if(runtime.pool.acquire(runtime.acc, runtime.warp, handle, runtime.diagnostics))
                     return true;
                 devicePause(runtime.args.idleNanosleep);
             }
@@ -688,7 +697,8 @@ namespace graph
                     index,
                     runtime.graph.streams[index].id,
                     makeAssemblySlot(first, capacityBytes),
-                    makeAssemblySlot(second, capacityBytes));
+                    makeAssemblySlot(second, capacityBytes),
+                    runtime.diagnostics);
             }
             return ok;
         }
@@ -736,7 +746,13 @@ namespace graph
                 }
             }
             // Reconverge after the leader-only CAS before the shuffle.
-            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
+            runtime.barrier.barrier(
+                runtime.acc,
+                runtime.blockThreads,
+                warp,
+                barrier_id::quiescenceCas,
+                static_cast<std::uint32_t>(WorkerStage::retiring),
+                0u);
             locked = warp.template broadcast<std::uint32_t>(locked, 0u);
             if(locked == 0u)
                 return false;
@@ -792,7 +808,13 @@ namespace graph
             }
             // Reconverge after the leader-only observation before distributing
             // the decision through shuffles.
-            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
+            runtime.barrier.barrier(
+                runtime.acc,
+                runtime.blockThreads,
+                warp,
+                barrier_id::quiescenceDecision,
+                static_cast<std::uint32_t>(WorkerStage::retiring),
+                0u);
             action = warp.template broadcast<std::uint32_t>(action, 0u);
             drainStream = warp.template broadcast<std::uint32_t>(drainStream, 0u);
 
@@ -831,7 +853,8 @@ namespace graph
                     drainStream,
                     blockIndex + 1u,
                     makeAssemblySlot(replacement, capacityBytes),
-                    published);
+                    published,
+                    runtime.diagnostics);
                 if(status == FlushStatus::Published)
                 {
                     std::uint64_t seed = 0u;
@@ -865,7 +888,7 @@ namespace graph
                 {
                     // Nothing was detached (count raced to zero) or the claim
                     // was busy: return the replacement to the pool.
-                    bool const released = runtime.pool.release(runtime.acc, warp, replacement);
+                    bool const released = runtime.pool.release(runtime.acc, warp, replacement, runtime.diagnostics);
                     if(leader)
                     {
                         if(!released)
@@ -894,7 +917,8 @@ namespace graph
             SchedulerRuntime<T_Acc>& runtime,
             std::uint32_t blockIndex,
             std::uint64_t deadlineCycles,
-            std::uint64_t /*deadlineIterations*/) noexcept
+            std::uint64_t /*deadlineIterations*/,
+            std::uint64_t iteration) noexcept
         {
             using Acc = typename SchedulerRuntime<T_Acc>::Acc;
             // Exactly one block initializes the ready ring and the packet pool.
@@ -924,14 +948,14 @@ namespace graph
                     runtime.state.debugRequiredSlots = requiredSlots(runtime.args.budget);
                     runtime.state.debugBudgetWorkers = runtime.args.budget.workers;
                 }
-                bool const configured = runtime.pool.configure(runtime.acc, runtime.warp, runtime.args.budget);
+                bool const configured = runtime.pool.configure(runtime.acc, runtime.warp, runtime.args.budget, runtime.diagnostics);
                 // The A/B chunk pairs come from the pool's free list, so this
                 // runs after configure() and before any worker can claim work.
                 bool const assembled = configured ? initializeAssembly(runtime) : false;
                 // The pool configure already distributed `configured` through
                 // its own handoff; the remaining startup flags follow through a
                 // second handoff so no lane depends on a shuffle.
-                WarpHandoff<Acc, StartupState, handoff_id::schedulerStartup> handoff;
+                WarpHandoff<Acc, StartupState, handoff_id::schedulerStartup> handoff{runtime.diagnostics};
                 StartupState local{};
                 if(runtime.warp.isLeader())
                 {
@@ -951,7 +975,7 @@ namespace graph
                         recordError(runtime, PoolError::unknownOperation);
                 }
                 handoff.publish(runtime.acc, runtime.warp, local);
-                handoff.sync(runtime.acc);
+                handoff.sync(runtime.acc, handoff_id::schedulerStartup);
                 ready = handoff.get(runtime.acc).ready != 0u;
                 // Publish every table and ring store before any worker reads.
                 // A device-scope release fence followed by a volatile store is
@@ -1001,7 +1025,13 @@ namespace graph
 #endif
                     devicePause(runtime.args.idleNanosleep);
                 }
-                runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
+                runtime.barrier.barrier(
+                    runtime.acc,
+                    runtime.blockThreads,
+                    runtime.warp,
+                    barrier_id::schedulerStartupInit,
+                    static_cast<std::uint32_t>(WorkerStage::waitInit),
+                    iteration);
                 alpaka::onAcc::memFence(runtime.acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::acquire);
                 observed = *initFlag != 0u;
                 if(runtime.warp.isLeader())
@@ -1039,7 +1069,7 @@ namespace graph
          * importer after a few jobs.
          */
         template<typename T_Acc>
-        ALPAKA_FN_ACC inline void importerStep(SchedulerRuntime<T_Acc>& runtime) noexcept
+        ALPAKA_FN_ACC inline void importerStep(SchedulerRuntime<T_Acc>& runtime, std::uint64_t iteration) noexcept
         {
             using Acc = typename SchedulerRuntime<T_Acc>::Acc;
             using DispatchHandoff = WarpHandoff<Acc, ImportDispatch, handoff_id::schedulerImport>;
@@ -1065,9 +1095,9 @@ namespace graph
                                         ? 1u
                                         : 0u;
                 }
-                DispatchHandoff handoff;
+                DispatchHandoff handoff{runtime.diagnostics};
                 handoff.publish(runtime.acc, runtime.warp, local);
-                handoff.sync(runtime.acc);
+                handoff.sync(runtime.acc, handoff_id::schedulerImport);
                 ImportDispatch const state = handoff.get(runtime.acc);
                 if(state.stagingCount == 0u || state.hasRoom == 0u)
                     break;
@@ -1137,9 +1167,9 @@ namespace graph
                                         ? 1u
                                         : 0u;
                 }
-                DispatchHandoff handoff;
+                DispatchHandoff handoff{runtime.diagnostics};
                 handoff.publish(runtime.acc, runtime.warp, local);
-                handoff.sync(runtime.acc);
+                handoff.sync(runtime.acc, handoff_id::schedulerImport);
                 ImportDispatch const state = handoff.get(runtime.acc);
                 if(state.stagingCount != 0u)
                     return;
@@ -1211,9 +1241,9 @@ namespace graph
                     }
                 }
             }
-            PollHandoff handoff;
+            PollHandoff handoff{runtime.diagnostics};
             handoff.publish(runtime.acc, runtime.warp, poll);
-            handoff.sync(runtime.acc);
+            handoff.sync(runtime.acc, handoff_id::schedulerImport + 1u);
             ImportPoll const result = handoff.get(runtime.acc);
             if(result.imported == 0u)
             {
@@ -1424,7 +1454,13 @@ namespace graph
             // per-lane count or runs a count-dependent loop, or the leader can
             // reach the next block barrier while other lanes are still in a
             // count-dependent loop.
-            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
+            runtime.barrier.barrier(
+                runtime.acc,
+                runtime.blockThreads,
+                warp,
+                barrier_id::schedulerExecute,
+                static_cast<std::uint32_t>(WorkerStage::executing),
+                0u);
             if(leader && job.operation.value < 8u)
                 (void) addDevice(runtime.acc, &runtime.state.execCounts[job.operation.value], std::uint64_t{1u});
 
@@ -1509,7 +1545,8 @@ namespace graph
                     replacements,
                     requestCount,
                     publications,
-                    maxAssemblyTargets);
+                    maxAssemblyTargets,
+                    runtime.diagnostics);
                 if(status == AppendStatus::StreamBusy)
                 {
                     devicePause(runtime.args.idleNanosleep);
@@ -1548,12 +1585,12 @@ namespace graph
                 }
                 if(!copyOk)
                 {
-                    reservation.cancel(runtime.acc, warp);
+                    reservation.cancel(runtime.acc, warp, runtime.diagnostics);
                     if(leader)
                         recordError(runtime, PoolError::packetExceedsCapacity);
                     return false;
                 }
-                if(!reservation.commit(runtime.acc, warp))
+                if(!reservation.commit(runtime.acc, warp, runtime.diagnostics))
                 {
                     // A competing writer committed in between; the reservation
                     // released every claim and mutated nothing. Retry.
@@ -1629,7 +1666,7 @@ namespace graph
             {
                 if(!hasScratch[port])
                     continue;
-                bool const released = runtime.pool.release(runtime.acc, warp, scratch[port]);
+                bool const released = runtime.pool.release(runtime.acc, warp, scratch[port], runtime.diagnostics);
                 if(leader)
                 {
                     if(!released)
@@ -1640,7 +1677,7 @@ namespace graph
             }
             for(std::uint32_t replacement = rotates; replacement < requestCount; ++replacement)
             {
-                bool const released = runtime.pool.release(runtime.acc, warp, replacements[replacement].handle);
+                bool const released = runtime.pool.release(runtime.acc, warp, replacements[replacement].handle, runtime.diagnostics);
                 if(leader)
                 {
                     if(!released)
@@ -1650,7 +1687,7 @@ namespace graph
             }
             if(!isSource)
             {
-                bool const released = runtime.pool.release(runtime.acc, warp, job.packet);
+                bool const released = runtime.pool.release(runtime.acc, warp, job.packet, runtime.diagnostics);
                 if(leader)
                 {
                     if(!released)
@@ -1667,14 +1704,21 @@ namespace graph
         ALPAKA_FN_ACC inline void schedulerLoop(SchedulerRuntime<T_Acc>& runtime, std::uint32_t blockIndex) noexcept
         {
             std::uint64_t idleIterations = 0u;
+            std::uint64_t iteration = 0u;
             while(true)
             {
+                ++iteration;
                 recordStage(runtime, blockIndex, WorkerStage::pollReady);
                 if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
                 {
                     recordStage(runtime, blockIndex, WorkerStage::exiting);
-                    if(runtime.warp.isLeader())
-                        return;
+                    // All lanes exit together: the stop reason is warp-uniform
+                    // (device-scope read, same value for every lane in the
+                    // warp). Exiting only the leader would leave the other
+                    // lanes in the loop, and their next barrier (quiescence,
+                    // assembly, or handoff) would see a divergent warp under
+                    // CUDA's independent thread scheduling.
+                    return;
                 }
 
                 // Every worker honors the mapped host abort word, not only the
@@ -1695,7 +1739,7 @@ namespace graph
                 if(blockIndex == 0u)
                 {
                     recordStage(runtime, blockIndex, WorkerStage::importerStep);
-                    importerStep(runtime);
+                    importerStep(runtime, iteration);
                     if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
                     {
                         recordStage(runtime, blockIndex, WorkerStage::exiting);
@@ -1704,7 +1748,7 @@ namespace graph
                 }
 
                 JobDescriptor job{};
-                RingStatus const status = runtime.ring.dequeue(runtime.acc, runtime.warp, job);
+                RingStatus const status = runtime.ring.dequeue(runtime.acc, runtime.warp, job, runtime.diagnostics);
                 if(status == RingStatus::Accepted)
                 {
                     idleIterations = 0u;
@@ -1718,7 +1762,13 @@ namespace graph
                         (void) orDevice(runtime.acc, &runtime.state.workerBits[word], bit);
                     }
                     // Order the leader's acquire before any lane reads packet data.
-                    runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
+                    runtime.barrier.barrier(
+                        runtime.acc,
+                        runtime.blockThreads,
+                        runtime.warp,
+                        barrier_id::schedulerClaim,
+                        static_cast<std::uint32_t>(WorkerStage::pollReady),
+                        iteration);
                     bool const executed = executeJob(runtime, job, blockIndex);
                     recordStage(
                         runtime,
@@ -1726,7 +1776,13 @@ namespace graph
                         WorkerStage::publishing,
                         executed ? WorkerLastAction::execute : WorkerLastAction::none);
                     // Order every lane's stores before the leader publishes or retires.
-                    runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
+                    runtime.barrier.barrier(
+                        runtime.acc,
+                        runtime.blockThreads,
+                        runtime.warp,
+                        barrier_id::schedulerPublish,
+                        static_cast<std::uint32_t>(WorkerStage::publishing),
+                        iteration);
                     bool published = false;
                     if(executed)
                         published = publishSuccessors(runtime, job);
@@ -1794,7 +1850,15 @@ namespace graph
                     "graph: a device operation pointer must have the size of a void pointer");
 
                 WarpGroup<Acc> const warp{acc};
-                WarpBarrier<Acc> const barrier{};
+                // Barrier divergence diagnostics for this launch. The state
+                // block is owned by the pool and zeroed (with sentinel first
+                // fields) before the launch; the flags mirror PoolConfig.
+                auto* diagState = static_cast<BarrierDiagnosticsState*>(args.barrierDiagnostics);
+                BarrierDiagnosticsConfig diagConfig;
+                diagConfig.enabled = args.barrierDiagnosticsEnabled != 0u;
+                diagConfig.skipOnDivergence = args.barrierSkipOnDivergence != 0u;
+                auto const diagnostics = WarpBarrierDiagnostics<Acc>::make(diagState, diagConfig);
+                WarpBarrier<Acc> const barrier{diagnostics};
                 auto const blockThreads = static_cast<std::uint32_t>(
                     acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
                 auto const blockIndex = static_cast<std::uint32_t>(
@@ -1843,6 +1907,7 @@ namespace graph
                 Runtime runtime{
                     acc,
                     warp,
+                    diagnostics,
                     barrier,
                     ring,
                     pool,
@@ -1853,11 +1918,18 @@ namespace graph
                     args,
                     blockThreads};
 
+                // `iteration` counts the scheduling-loop iterations of this
+                // warp; it is published with every stage record and barrier
+                // divergence record, so a first divergence names the loop
+                // position of the warp that first reached the barrier
+                // divergent.
+                std::uint64_t iteration = 0u;
                 bool const started = startupRendezvous<T_Binder>(
                     runtime,
                     blockIndex,
                     args.initDeadlineCycles,
-                    args.initDeadlineIterations);
+                    args.initDeadlineIterations,
+                    iteration);
                 if(!started)
                     return;
                 schedulerLoop(runtime, blockIndex);

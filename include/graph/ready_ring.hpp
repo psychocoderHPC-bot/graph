@@ -294,14 +294,15 @@ namespace graph
         ALPAKA_FN_ACC constexpr RingStatus enqueue(
             Acc const& acc,
             WarpGroup<Acc> const& warp,
-            ReadyEntry const& entry) noexcept
+            ReadyEntry const& entry,
+            WarpBarrierDiagnostics<Acc> const& diagnostics = {}) noexcept
         {
-            WarpHandoff<Acc, std::uint32_t, handoff_id::readyRingPush> handoff;
+            WarpHandoff<Acc, std::uint32_t, handoff_id::readyRingPush> handoff{diagnostics};
             std::uint32_t status = static_cast<std::uint32_t>(RingStatus::Contended);
             if(warp.isLeader())
                 status = static_cast<std::uint32_t>(pushOnce(acc, entry));
             handoff.publish(acc, warp, status);
-            handoff.sync(acc);
+            handoff.sync(acc, handoff_id::readyRingPush);
             return static_cast<RingStatus>(handoff.get(acc));
         }
 
@@ -319,14 +320,15 @@ namespace graph
         ALPAKA_FN_ACC constexpr RingStatus dequeue(
             Acc const& acc,
             WarpGroup<Acc> const& warp,
-            ReadyEntry& out) noexcept
+            ReadyEntry& out,
+            WarpBarrierDiagnostics<Acc> const& diagnostics = {}) noexcept
         {
-            WarpHandoff<Acc, ClaimResult, handoff_id::readyRingClaim> handoff;
+            WarpHandoff<Acc, ClaimResult, handoff_id::readyRingClaim> handoff{diagnostics};
             ClaimResult claim{};
             if(warp.isLeader())
                 claim = claimOnce(acc);
             handoff.publish(acc, warp, claim);
-            handoff.sync(acc);
+            handoff.sync(acc, handoff_id::readyRingClaim);
             ClaimResult const result = handoff.get(acc);
             if(result.valid != 0u)
                 out = result.entry;

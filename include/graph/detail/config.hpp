@@ -45,3 +45,19 @@
 #ifndef GRAPH_KERNEL_REGISTERS_FALLBACK
 #    define GRAPH_KERNEL_REGISTERS_FALLBACK 128
 #endif
+
+
+/** Upper bound on the number of worker blocks (one warp per block) that a
+ *  single pool launch may track. This is the pool's tracking capacity: every
+ *  per-worker device array is sized by this bound, and a launch whose geometry
+ *  exceeds it is refused before the kernel is started.
+ *
+ *  This constant lives in the lowest-level configuration header so that any
+ *  header that needs a per-worker array bound (the barrier divergence
+ *  diagnostics, the pool control state, the packet pool) can name it without
+ *  pulling in the pool's own control header.
+ */
+namespace graph
+{
+    inline constexpr std::uint32_t poolMaxWorkers = 4096u;
+} // namespace graph

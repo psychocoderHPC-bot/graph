@@ -511,9 +511,9 @@ TEST_CASE("pool assembly runs on the CUDA backend", "[graph][pool][assembly][cud
     ToyAssemblyHarness harness(cuda.device, cuda.executor, chunk, static_cast<std::uint32_t>(count), 2u);
     harness.config().maxReadyInFlight = 16u;
     harness.config().budget.liveParticles = 256u;
-    // The multi-worker exit path is a separate, disclosed gap; exercise the
-    // full assembly pipeline with one worker on this backend.
-    harness.config().testWorkerLimit = 1u;
+    // The multi-worker exit-path defect is fixed (the divergent barrier arrival
+    // was a control-flow bug, now named by the barrier divergence diagnostic);
+    // the full 8-worker multi-worker path is exercised here.
     auto pool = harness.start(feedbackGraph(chunk, 2u));
     std::array<graph::RequestSpec, 1u> const requests{graph::RequestSpec{0u, count, 5u}};
     REQUIRE(pool.tryEnqueue(std::span<graph::RequestSpec const>{requests}).accepted == 1u);

@@ -189,6 +189,34 @@ namespace graph
             }
         }
 
+        /** Active-lane mask of the calling warp at the call site.
+         *
+         * One bit per lane of the warp. The mask is the *converged* set of
+         * lanes at the call site: on CUDA it is `__activemask()`, which reports
+         * the lanes that the hardware currently keeps converged here. A
+         * converged warp of width `w` sees `w - 1`; a mask with a missing bit
+         * is direct evidence of divergent control flow. It is a *detection*
+         * primitive: it must never be passed to a collective as the lane mask
+         * of an ordering or data-exchange operation for the same reason the
+         * handoff file avoids `__shfl_sync(__activemask(), ...)`.
+         *
+         * Width one has no other lane: the only possible mask is the full one.
+         */
+        ALPAKA_FN_ACC constexpr BallotMask activeMask() const noexcept
+        {
+            if constexpr(compileTimeWarpSize == 1u)
+            {
+                return BallotMask{1u};
+            }
+            else
+            {
+                auto const width = workerWidth();
+                if(width <= 1u)
+                    return BallotMask{1u};
+                return static_cast<BallotMask>(alpaka::onAcc::warp::activemask(*m_acc));
+            }
+        }
+
         /** True when every active lane satisfies `predicate`. */
         ALPAKA_FN_ACC constexpr bool all(bool predicate) const noexcept
         {

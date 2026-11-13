@@ -325,6 +325,8 @@ namespace graph
             using HostByteBuffer = decltype(alpaka::onHost::allocHost<std::uint8_t>(std::size_t{1}));
             using StateBuffer = decltype(alpaka::onHost::alloc<PoolDeviceState>(std::declval<Device>(), 1u));
             using HostStateBuffer = decltype(alpaka::onHost::allocHost<PoolDeviceState>(1u));
+            using DiagBuffer = decltype(alpaka::onHost::alloc<BarrierDiagnosticsState>(std::declval<Device>(), 1u));
+            using HostDiagBuffer = decltype(alpaka::onHost::allocHost<BarrierDiagnosticsState>(1u));
             using HostControlBuffer
                 = decltype(alpaka::onHost::allocMapped<PoolHostControl>(std::declval<Device>(), 1u));
             using TableBuffer = decltype(alpaka::onHost::alloc<OperationTableLayout>(std::declval<Device>(), 1u));
@@ -425,6 +427,8 @@ namespace graph
                 m_assemblyStorage.emplace(alpaka::onHost::alloc<std::uint8_t>(m_device, assemblyBytes));
                 m_deviceState.emplace(alpaka::onHost::alloc<PoolDeviceState>(m_device, 1u));
                 m_hostState.emplace(alpaka::onHost::allocHost<PoolDeviceState>(1u));
+                m_diagnosticsState.emplace(alpaka::onHost::alloc<BarrierDiagnosticsState>(m_device, 1u));
+                m_hostDiagnostics.emplace(alpaka::onHost::allocHost<BarrierDiagnosticsState>(1u));
                 m_hostControl.emplace(alpaka::onHost::allocMapped<PoolHostControl>(m_device, 1u));
                 m_ringHeaderHost.emplace(
                     alpaka::onHost::allocHost<std::uint8_t>(static_cast<std::size_t>(sizeof(ReadyRingLayout))));
@@ -625,6 +629,16 @@ namespace graph
                 std::memset(alpaka::onHost::data(*m_hostState), 0, sizeof(PoolDeviceState));
                 alpaka::onHost::memcpy(m_queue, *m_deviceState, *m_hostState);
 
+                // The divergence diagnostics state starts with `divergenceCount`
+                // zero and the named fields at their sentinel values, so the
+                // host can tell "never diverged" from a recorded first site.
+                auto* hostDiag = alpaka::onHost::data(*m_hostDiagnostics);
+                std::memset(hostDiag, 0, sizeof(BarrierDiagnosticsState));
+                hostDiag->firstBarrierId = ~std::uint32_t{0u};
+                hostDiag->firstWorker = ~std::uint32_t{0u};
+                hostDiag->firstStage = ~std::uint32_t{0u};
+                alpaka::onHost::memcpy(m_queue, *m_diagnosticsState, *m_hostDiagnostics);
+
                 auto* control = alpaka::onHost::data(*m_hostControl);
                 std::memset(control, 0, sizeof(PoolHostControl));
                 control->initDone = 0u;
@@ -697,6 +711,9 @@ namespace graph
                 args.assemblyStorage = alpaka::onHost::data(*m_assemblyStorage);
                 args.assemblyStreamCount = m_graph.streamCount;
                 args.assemblySlotCount = static_cast<std::uint32_t>(poolPacketSlotCapacity);
+                args.barrierDiagnostics = alpaka::onHost::data(*m_diagnosticsState);
+                args.barrierDiagnosticsEnabled = m_config.testEnableBarrierDiagnostics;
+                args.barrierSkipOnDivergence = m_config.testBarrierSkipOnDivergence;
 
                 auto const threadSpec
                     = alpaka::onHost::ThreadSpec{m_geometry.blocks, m_geometry.threadsPerBlock, m_executor};
@@ -714,6 +731,7 @@ namespace graph
                     alpaka::onHost::wait(*m_event);
 
                 alpaka::onHost::memcpy(m_queue, *m_hostState, *m_deviceState);
+                alpaka::onHost::memcpy(m_queue, *m_hostDiagnostics, *m_diagnosticsState);
                 auto const headerBytes
                     = alpaka::Vec<std::uint32_t, 1u>{static_cast<std::uint32_t>(sizeof(ReadyRingLayout))};
                 auto const headerView = alpaka::makeView(
@@ -726,6 +744,47 @@ namespace graph
                 PoolDeviceState const* state = alpaka::onHost::data(*m_hostState);
                 ReadyRingLayout header{};
                 std::memcpy(&header, alpaka::onHost::data(*m_ringHeaderHost), sizeof(ReadyRingLayout));
+                BarrierDiagnosticsState const* diag = alpaka::onHost::data(*m_hostDiagnostics);
+
+                // Barrier divergence diagnostics: report whether the check ran
+                // and, when it saw a divergence, the first call site that
+                // reached the block barrier with a non-full active mask. A
+                // divergent arrival at a block barrier is a control-flow defect
+                // (deadlock), so naming the site is the whole point of the
+                // diagnostic; the per-worker histogram localizes which warps.
+                PoolResult::BarrierDiagnosticsSnapshot diagSnapshot;
+                diagSnapshot.enabled = enableBarrierDivergenceDiagnostics && m_config.testEnableBarrierDiagnostics;
+                diagSnapshot.divergenceCount = diag->divergenceCount;
+                diagSnapshot.firstBarrierId = diag->firstBarrierId;
+                diagSnapshot.firstWorker = diag->firstWorker;
+                diagSnapshot.firstStage = diag->firstStage;
+                diagSnapshot.firstIteration = diag->firstIteration;
+                diagSnapshot.firstMask = diag->firstMask;
+                diagSnapshot.firstWidth = diag->firstWidth;
+                if(diagSnapshot.enabled && diag->divergenceCount != 0u)
+                {
+                    std::printf(
+                        "[pool-diag] BARRIER DIVERGENCE count=%llu first: barrierId=%u worker=%u stage=%u "
+                        "iter=%llu mask=0x%x width=%u\n",
+                        static_cast<unsigned long long>(diag->divergenceCount),
+                        static_cast<unsigned>(diag->firstBarrierId),
+                        static_cast<unsigned>(diag->firstWorker),
+                        static_cast<unsigned>(diag->firstStage),
+                        static_cast<unsigned long long>(diag->firstIteration),
+                        static_cast<unsigned>(diag->firstMask),
+                        static_cast<unsigned>(diag->firstWidth));
+                    for(std::uint32_t worker = 0u; worker < m_geometry.workerCount; ++worker)
+                    {
+                        if(diag->perWorkerDivergences[worker] != 0u)
+                        {
+                            std::printf(
+                                "[pool-diag]   worker=%u divergences=%u\n",
+                                static_cast<unsigned>(worker),
+                                static_cast<unsigned>(diag->perWorkerDivergences[worker]));
+                        }
+                    }
+                    std::fflush(stdout);
+                }
 
                 std::uint64_t distinctWorkers = 0u;
                 std::uint32_t const words = (m_geometry.workerCount + 63u) / 64u;
@@ -812,6 +871,7 @@ namespace graph
                 PoolResult result;
                 result.counters = snapshot;
                 result.errorWord = state->errorWord;
+                result.barrierDiagnostics = diagSnapshot;
                 if(state->stopReason == poolStoppingDrained && snapshot.outstanding == 0u
                    && snapshot.pendingSources == 0u && snapshot.partialBuffers == 0u)
                 {
@@ -855,6 +915,8 @@ namespace graph
             std::optional<StagingBuffer> m_staging;
             std::optional<StateBuffer> m_deviceState;
             std::optional<HostStateBuffer> m_hostState;
+            std::optional<DiagBuffer> m_diagnosticsState;
+            std::optional<HostDiagBuffer> m_hostDiagnostics;
             std::optional<HostControlBuffer> m_hostControl;
             std::optional<HostByteBuffer> m_ringHeaderHost;
             std::optional<EventType> m_event;
