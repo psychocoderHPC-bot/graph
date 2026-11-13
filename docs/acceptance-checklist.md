@@ -7,7 +7,10 @@ SPDX-License-Identifier: MPL-2.0
 
 Release gate for the initial implementation, per design sections 9 and 10.
 State of the tree at commit `a12bfbe7c87497c91aaa8503a7fc5545c8c3d169`
-(`main`). Every command below carries the hal environment scrub prefix:
+(`main`). Sections 4, 6, and 8 also cite the W17 harness run at merge commit
+`807b4375c1a49faa59ebae56fc2c251e6ce8a2d4`, which adds only the harness script
+and documentation to that tree. Every command below carries the hal environment
+scrub prefix:
 
 ```sh
 env -u LD_LIBRARY_PATH -u LIBRARY_PATH -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH
@@ -60,12 +63,11 @@ N=0, 1, 7, 128, 1000, 4096 (seeds 42 and 7) and 65536 (seeds 42 and 7).
 
 ## 4. 20x pool repeat
 
-There is no dedicated 20-repetition test at this commit. The closest
-automated repetition is `chunk_assembly publication ordering is enforced by a
-real barrier` (200 kernel launches x 100 rounds) and the pool tests, which
-each start and stop one pool.
-Status: **PENDING** as a named gate item. The pool tests all pass; the repeat
-is not separately counted.
+`scripts/hal-acceptance.sh --pool-repeat 20` runs the CUDA CTest cases matching
+`-R pool` 20 times each through `ctest --repeat until-fail:20`.
+Status: **PASS** on `807b4375` (W17 run: 480/480 case runs, 24 cases x 20,
+0 failed, 87.00 s; `pool-repeat.log` holds 480 start lines and 480 result
+lines).
 
 ## 5. Ladder and worker-count sweep
 
@@ -87,11 +89,12 @@ sink(correct/dup/missing/wrong)=712/0/0/0 stopReason=1 OK
 
 ## 6. Memcheck run
 
-No memcheck (compute-sanitizer) step is defined in `.gitlab-ci.yml` or in
-`scripts/hal-acceptance.sh`, and no memcheck run is recorded in the W16
-artifact.
-Status: **PENDING** as a gate item. No memcheck result may be claimed for
-`a12bfbe7`.
+`scripts/hal-acceptance.sh --sanitize` runs compute-sanitizer memcheck over two
+CUDA groups: `[graph][pool][ladder],[graph][pool][probe]` and
+`[chunk_assembly][gpu]`.
+Status: **PASS** on `807b4375` (W17 run). Both
+`sanitizer-memcheck-pool-ladder-probe.log` and
+`sanitizer-memcheck-chunk-publication.log` report `ERROR SUMMARY: 0 errors`.
 
 ## 7. Format and REUSE
 
@@ -117,7 +120,7 @@ Each fact below is quoted from an artifact that exists.
 | Mapped pinned ingress throughput | about 1.6 to 1.67 M msg/s with a single-warp consumer (1671894.5 and 1603948.7 msg/s) | P1 probe `results/p1_a.txt`, `results/p1_a_egress_per_message.txt`; `artifacts/P1-protocol-probes.md` section 6 |
 | Copy-queue overlap | requires pinned buffers on CUDA | `copy_queue overlaps a busy worker queue on CUDA`; `copy_queue rejects pageable host buffers on CUDA` |
 | Sink accounting at all worker counts 128..896 | 712/0/0/0 (correct/duplicate/missing/wrong) at every rung of the ladder and sweep | W16 `diagnostics-cuda.txt`; the sweep asserts `sink.correct == totalItems` and zero duplicate/missing/wrong per worker count |
-| Memcheck | clean | **no recorded memcheck run at this commit; the fact is not claimable** |
+| Memcheck | clean: both CUDA memcheck groups report `0 errors` | W17 `sanitizer-memcheck-pool-ladder-probe.log`, `sanitizer-memcheck-chunk-publication.log` (`ERROR SUMMARY: 0 errors`) |
 
 ## 9. Open items
 
@@ -143,7 +146,6 @@ Each fact below is quoted from an artifact that exists.
 5. **CI pipeline.** The GitLab workflow is committed; the project connection,
    runner tags, and the CUDA image are not provisioned. No pipeline result
    exists for any commit (`docs/ci.md`).
-6. **Memcheck.** Not part of the harness; no run recorded (section 6).
 
 ## 10. PASS/PENDING table per design section 9/10
 
@@ -174,7 +176,6 @@ Each fact below is quoted from an artifact that exists.
    the three fixture cases plus the CUDA comparison.
 2. Add the end-to-end test that consumes `tests/reference/test-vectors.md`.
 3. Run the example at a multi-worker, multi-round size on the A30.
-4. Add and record a memcheck pass over the CUDA suite.
-5. Provision the GitLab runners and run the committed workflow end to end.
-6. Close the chunk-publication barrier guard gap, or document it as a known
+4. Provision the GitLab runners and run the committed workflow end to end.
+5. Close the chunk-publication barrier guard gap, or document it as a known
    limitation with the P1 probe evidence.
