@@ -296,7 +296,7 @@ namespace
             "[ladder] rung=%zu %-26s workers=%u accepted=%llu imported=%llu queued=%llu claimed=%llu "
             "executed=%llu published=%llu retired=%llu distinctWorkers=%llu items=%llu "
             "sink(correct/dup/missing/wrong)=%llu/%llu/%llu/%llu writes=%llu errorWord=0x%x ctlError=0x%llx "
-            "stopReason=%u stopStage=%u blocked=%llu empty=%llu %s\n",
+            "stopReason=%u stopStage=%u blocked=%llu empty=%llu claims=%llu %s\n",
             index,
             rung.name,
             static_cast<unsigned>(out.geometryWorkers),
@@ -320,6 +320,7 @@ namespace
             static_cast<unsigned>(out.stopStage),
             static_cast<unsigned long long>(out.importBlocked),
             static_cast<unsigned long long>(out.importEmpty),
+            static_cast<unsigned long long>(c.initializerClaims),
             out.green ? "OK" : "DIVERGED");
         std::fflush(stdout);
     }
@@ -361,6 +362,7 @@ TEST_CASE("pool gpu correctness ladder: rising worker count, exactly-once sink",
         CHECK(outcome.reason == graph::PoolStopReason::stoppedByDrain);
         CHECK(outcome.errorWord == 0u);
         CHECK(outcome.controlErrorWord == 0u);
+        CHECK(outcome.counters.initializerClaims == 1u);
         CHECK(outcome.counters.outstanding == 0u);
         CHECK(outcome.counters.pendingSources == 0u);
         CHECK(outcome.counters.queued == 0u);
@@ -370,6 +372,61 @@ TEST_CASE("pool gpu correctness ladder: rising worker count, exactly-once sink",
         CHECK(outcome.sink.missing == 0u);
         CHECK(outcome.sink.wrong == 0u);
     }
+}
+
+TEST_CASE("pool gpu worker-count sweep: the former abort threshold stays green", "[graph][pool][sweep][gpu]")
+{
+    // The pool used to abort at 256 workers and above (a power-of-two
+    // threshold) and at the full wave. That threshold is swept explicitly so a
+    // regression of the initializer election is caught at the boundary instead
+    // of only at the full geometry.
+    auto handles = makeCudaHandles();
+
+    std::vector<std::uint64_t> requests;
+    requests.push_back(200u);
+    for(std::uint32_t index = 0u; index < 16u; ++index)
+        requests.push_back(32u);
+    std::uint64_t const totalItems = 712u;
+
+    // Learn the full launch geometry from an uncapped run first: the installed
+    // device decides how many of the requested worker counts exist.
+    Rung const full{"full geometry", 0u, 32u, requests, 17u};
+    auto const fullOutcome = runRung(handles.device, handles.executor, full, totalItems);
+    printRow(0u, full, fullOutcome);
+    CHECK(fullOutcome.green);
+    std::uint32_t const geometryWorkers = fullOutcome.geometryWorkers;
+
+    bool sawFormerThreshold = false;
+    for(auto const workers : {128u, 192u, 256u, 384u, 512u, 768u, 896u})
+    {
+        if(workers > geometryWorkers)
+        {
+            std::printf(
+                "[sweep] workers=%u exceeds the %u-worker geometry of this device; not exercised\n",
+                static_cast<unsigned>(workers),
+                static_cast<unsigned>(geometryWorkers));
+            continue;
+        }
+        Rung const rung{"sweep", workers, 32u, requests, 17u};
+        auto const outcome = runRung(handles.device, handles.executor, rung, totalItems);
+        printRow(workers, rung, outcome);
+        INFO("sweep workers " << workers << ": " << outcome.failure);
+        CHECK(outcome.reason == graph::PoolStopReason::stoppedByDrain);
+        CHECK(outcome.errorWord == 0u);
+        CHECK(outcome.counters.initializerClaims == 1u);
+        CHECK(outcome.counters.outstanding == 0u);
+        CHECK(outcome.counters.pendingSources == 0u);
+        CHECK(outcome.counters.queued == 0u);
+        CHECK(outcome.counters.active == 0u);
+        CHECK(outcome.sink.correct == outcome.totalItems);
+        CHECK(outcome.sink.duplicated == 0u);
+        CHECK(outcome.sink.missing == 0u);
+        CHECK(outcome.sink.wrong == 0u);
+        sawFormerThreshold = sawFormerThreshold || workers == 256u;
+    }
+    // The documented former threshold must be exercised, never silently
+    // skipped: every supported device has at least 256 workers.
+    REQUIRE(sawFormerThreshold);
 }
 
 #endif // GRAPH_HAS_CUDA

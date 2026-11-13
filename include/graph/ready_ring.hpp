@@ -358,10 +358,24 @@ namespace graph
         }
 
     private:
+        /** Acquire the ring lock, with the release/acquire pair the counters
+         *  need.
+         *
+         * The lock CAS is a *relaxed* device-scope atomic, and the ring reads
+         * `pushCounter`/`claimCounter` and the slot payload with plain loads.
+         * Without an acquire after the successful CAS this SM may serve those
+         * loads from an L1 line that is stale relative to the previous lock
+         * owner, so a claim can read an already advanced `claimCounter`, claim
+         * the same entry again, and write the same `claimCounter` value back:
+         * one entry delivered twice and the counter advanced once. The
+         * acquire below pairs with the release in `unlock()`. */
         ALPAKA_FN_ACC constexpr bool tryLock(Acc const& acc) const noexcept
         {
-            return ring_detail::atomicCasDevice(acc, &header().lock, std::uint32_t{0u}, std::uint32_t{1u})
-                   == std::uint32_t{0u};
+            if(ring_detail::atomicCasDevice(acc, &header().lock, std::uint32_t{0u}, std::uint32_t{1u})
+               != std::uint32_t{0u})
+                return false;
+            ring_detail::claimAcquire(acc);
+            return true;
         }
 
         ALPAKA_FN_ACC constexpr void unlock(Acc const& acc) const noexcept

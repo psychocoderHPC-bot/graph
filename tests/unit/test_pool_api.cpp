@@ -72,6 +72,54 @@ TEST_CASE("pool config validation accepts a legal budget and names an undersized
     CHECK(!graph::validatePoolConfig(badBatch, geometry).empty());
 }
 
+TEST_CASE("pool worker capacity is accommodated below the limit and refused by name above it", "[graph][pool][api]")
+{
+    // Every per-worker array in the device state is sized by
+    // `graph::poolMaxWorkers`. The validator must either accommodate a geometry
+    // that fits or refuse it with the named `workerCapacityExceeded` error; it
+    // must never accept a geometry the kernel would then index out of range.
+    auto config = makeToyConfig(8u);
+    // A large slot budget keeps the capacity check the deciding one: the packet
+    // and ready-ring formulas are satisfied for the biggest tracked geometry.
+    constexpr std::uint32_t slots = 1u << 20u;
+
+    // Above every compile-time worker default in the tree (the 896-block launch
+    // wave and `PacketPoolTraits::maxWorkers == 1024`) the geometry is
+    // accommodated, not clamped.
+    auto large = smallGeometry();
+    large.blocks = 2048u;
+    large.workerCount = 2048u;
+    CHECK(graph::validatePoolConfig(config, large, slots).empty());
+
+    // At exactly `poolMaxWorkers` the worker-capacity check itself must not
+    // fire; whatever else rejects the configuration names a different contract.
+    auto atCapacity = smallGeometry();
+    atCapacity.blocks = graph::poolMaxWorkers;
+    atCapacity.workerCount = graph::poolMaxWorkers;
+    CHECK(graph::validatePoolConfig(config, atCapacity, slots).find("workerCapacityExceeded") == std::string::npos);
+
+    auto aboveCapacity = smallGeometry();
+    aboveCapacity.blocks = graph::poolMaxWorkers + 1u;
+    aboveCapacity.workerCount = graph::poolMaxWorkers + 1u;
+    std::string const error = graph::validatePoolConfig(config, aboveCapacity, slots);
+    CHECK(!error.empty());
+    CHECK(error.find("workerCapacityExceeded") != std::string::npos);
+    CHECK(error.find(std::to_string(graph::poolMaxWorkers + 1u)) != std::string::npos);
+
+    // The budget is validated against the same capacity, not only the geometry.
+    auto oversizedBudget = makeToyConfig(8u);
+    oversizedBudget.budget.workers = graph::poolMaxWorkers + 1u;
+    std::string const budgetError = graph::validatePoolConfig(oversizedBudget, smallGeometry(), slots);
+    CHECK(!budgetError.empty());
+    CHECK(budgetError.find("workerCapacityExceeded") != std::string::npos);
+
+    // The named error bit is part of the public error vocabulary.
+    CHECK(
+        graph::poolErrorSet(
+            graph::poolErrorBits(graph::PoolError::workerCapacityExceeded),
+            graph::PoolError::workerCapacityExceeded));
+}
+
 TEST_CASE("pool that was never started reports never-started and rejects submissions", "[graph][pool][api]")
 {
     graph::Pool pool;

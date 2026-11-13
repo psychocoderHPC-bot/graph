@@ -35,23 +35,21 @@ broadcast only in uniform control flow. The gate for reintroducing shuffles into
 collective path is a broadcast primitive that passes an explicit full mask plus a warp convergence
 point; the pinned alpaka does not provide one.
 
-## Full-geometry CUDA pool still aborts above 192 workers
-The shuffle defect above is fixed and the correctness ladder
-(`tests/integration/test_pool_ladder_gpu.cpp`) is green up to 192 workers, but the pool still aborts
-at 256 workers and above, including the full 896-worker geometry. The signature is stable:
-`errorWord 0x240` (`internalState` plus `aborted`), `debugStopStage 2` (`executeJob` returned false),
-`imported` stops at the first `maxImportBatch` batch, and the sink accounting is
-`correct=0 duplicated=0 missing=N`. The job that trips the abort carries a handle that a successful
-`PacketPool::acquire` issued, while the slot record read back by the executing block still holds its
-initial free-list value (`{next slot, generation 0}`), i.e. the state `configure()` wrote.
+## The initializer role must stay unique
+The pool used to abort at 256 workers and above (a power-of-two threshold) and at the full 896-block
+wave, with `errorWord 0x240` and sink accounting `correct=0 missing=N`. The initializer role was
+inferred from a block-index comparison, and on the full wave every block evaluated it as "I am the
+initializer", so all of them ran `ReadyRing::initialize()` and `PacketPool::configure()`. A late
+`configure()` rewrites each slot record to its initial free-list value, so a slot handed out by an
+earlier `acquire()` read back as `{next slot, generation 0}` and the executing block dropped the job.
+The wait path was never exercised by those blocks and formed a host-only `steady_clock` deadline in
+device code.
 
-Ruled out so far, each with a direct measurement on the A30: descriptor distribution (probe 3 is
-green and no pool decision uses a shuffle), the claim handoff (leader value and block-shared read
-agree), concurrent pool configuration (a mapped per-block marker in `PoolHostControl::blockPhase`
-shows exactly one initializing block in every rung), and weak-load staleness (the record reads are
-`ld.acquire.gpu` acquire loads through `detail::dev::loadAcquire`). The remaining suspects are the
-packet-pool record publication/hand-out and the free-list walk under >=256 concurrent warps; the
-gate is the ladder rung 7 with `correct=N, duplicated=0, missing=0` and a 20x `-R pool` repeat.
+Both are closed: the role is decided from the block index the kernel derives from the accelerator
+and passes by value, the wait path no longer forms a host clock read on the device, and
+`QuiescenceSnapshot::initializerClaims` is asserted to be one on every ladder rung and every point of
+the 128..896 worker sweep. That counter is the regression gate: a second initializer means the pool
+was re-configured underneath live owners.
 
 ## Multi-warp-per-block is refused by design
 `WarpBarrier::barrier()` maps to a block-wide barrier only when the block holds exactly one warp.
