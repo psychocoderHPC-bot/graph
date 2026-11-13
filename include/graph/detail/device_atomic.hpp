@@ -22,6 +22,33 @@
  *
  * The header is intentionally dependency-free: `packet_pool.hpp` and
  * `pool_control.hpp` both need it, and `pool_control.hpp` includes the pool.
+ *
+ * # Project rule: cross-worker loop exit conditions
+ *
+ * A flag that one worker writes and another reads in a wait loop (a stop or
+ * drain flag, a startup `initDone`, a ring or pool counter observed from another
+ * block) must be observable on every iteration of the wait. The rule:
+ *
+ * - The flag is **atomic or volatile**, and it is **re-read inside the loop
+ *   body on every iteration**. An atomic load with `memory_order_acquire`
+ *   (`loadDeviceAcquire`, or `systemLoadAcquire` on a mapped word) is preferred:
+ *   it pairs with the writer's release store and also orders the payload the
+ *   flag publishes. A plain `volatile` read is sufficient only when the word is
+ *   genuinely a single flag whose publication needs no ordering and whose writer
+ *   is a different *worker* (the compiler cannot cache a `volatile` read across
+ *   the loop).
+ * - A **plain member must never be a loop exit condition in device code.** The
+ *   compiler may prove a plain (non-atomic, non-volatile) local or member
+ *   invariant inside the loop and hoist the load out of it; the worker then
+ *   spins on the first value forever, even when another worker has set the flag.
+ * - **Never cache a cross-worker flag in a local before the loop**
+ *   (`auto stop = s.stop;` and then loop on `stop`): the copy is not
+ *   observable, so the loop exits only if the flag was already set at entry.
+ *
+ * The regression test `tests/integration/test_hoisted_flag.cpp` pins this: a
+ * worker spins on a flag set by another worker after a delay, with a budget; a
+ * cached (hoisted) load exhausts the budget and fails, a re-reading load
+ * finishes in well under it.
  */
 namespace graph
 {

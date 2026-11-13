@@ -467,6 +467,18 @@ namespace graph
                 alpaka::onAcc::memFence(runtime.acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
                 if(runtime.warp.isLeader())
                 {
+                    // Ordering of the `initDone` flag (project rule, see
+                    // `device_atomic.hpp`): block 0 is the sole writer. It
+                    // release-fences all of the table and ring stores above,
+                    // then volatile-stores `state.initDone`. The volatile write
+                    // is a store the compiler cannot move across the fence, so
+                    // it announces the release for the reader to observe. Every
+                    // non-initializing block reads `state.initDone` as volatile
+                    // in a bounded loop (below), so it re-reads the word each
+                    // iteration and cannot cache the initial zero; the acquire
+                    // fence after the loop pairs with this release and makes the
+                    // published table and ring visible. A plain member would let
+                    // the reader's compiler hoist the load out of the loop.
                     *reinterpret_cast<std::uint64_t volatile*>(&runtime.state.initDone) = 1u;
                     graph::systemStoreRelease(runtime.acc, &runtime.host.initDone, std::uint64_t{1u});
                 }
@@ -481,6 +493,13 @@ namespace graph
                 using Api = ALPAKA_TYPEOF(runtime.acc.getApi());
                 constexpr bool isCuda = std::is_same_v<std::remove_cvref_t<Api>, alpaka::api::Cuda>;
                 (void) deadlineCycles;
+                // `initDone` is read as volatile inside the loop body: it is the
+                // cross-worker startup flag, and the project rule (see
+                // `device_atomic.hpp`) requires it to be re-read every iteration
+                // so a compiler cannot hoist the load and spin on the initial
+                // zero. `volatile` suffices here because the publication ordering
+                // is carried by the release/acquire fence pair, not by the load
+                // itself.
                 auto* initFlag = reinterpret_cast<std::uint64_t volatile*>(&runtime.state.initDone);
                 // The host deadline must never be *formed* on the device: a
                 // `__host__`-only clock read inside a device function is
