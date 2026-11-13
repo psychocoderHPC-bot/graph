@@ -655,11 +655,19 @@ namespace graph
                     slot->meta.generation += 1u;
                     slot->meta.active = 1u;
                     slot->record.handle.index = index;
-                    slot->record.handle.generation = slot->meta.generation;
                     slot->record.elementCount = 0u;
                     slot->record.schema = ElementSchema{};
-                    // Release the record before the caller reads it.
-                    pool_detail::publishRelease(acc);
+                    // Publish the record with a *release store on the generation
+                    // word*, and store the generation last. The generation is
+                    // exactly the word a consumer acquire-loads to decide
+                    // ownership (`observedGeneration()`), so it must be the word
+                    // that publishes every store above it. A release fence
+                    // placed *after* the record stores (the previous form) has
+                    // no following store to announce them and does not order
+                    // them for `ld.acquire`, so a consumer in another block may
+                    // legitimately still read the initial free-list generation 0
+                    // and drop a job whose slot this CAS already handed out.
+                    detail::dev::storeRelease(&slot->record.handle.generation, slot->meta.generation);
                     (void) pool_detail::atomicAddDevice(acc, &hdr->headVersion, std::uint32_t{1u});
                     // Decrement: freeCount is a uint64_t; the value -1 wraps to
                     // 0xFFFF...FFFF which is the correct 2's-complement decrement.

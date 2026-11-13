@@ -81,7 +81,17 @@ namespace graph
         /** The ready ring reported an ownership violation. */
         readyRingViolation = 1u << 8u,
         /** A scheduler invariant failed (should not happen). */
-        internalState = 1u << 9u
+        internalState = 1u << 9u,
+        /**
+         * The launch geometry needs more workers than the pool can track.
+         *
+         * Every per-worker array in `PoolDeviceState` is sized by
+         * `poolMaxWorkers`. A geometry above that capacity is refused with this
+         * named error at validation, and the device kernel refuses to form an
+         * out-of-range worker index and stops with the same bit. It is never
+         * accepted and then indexed out of range.
+         */
+        workerCapacityExceeded = 1u << 10u
     };
 
     ALPAKA_FN_HOST_ACC constexpr std::uint32_t poolErrorBits(PoolError error) noexcept
@@ -189,13 +199,15 @@ namespace graph
         if(geometry.workerCount == 0u || geometry.warpsPerBlock != 1u)
             return "graph: pool requires the one-warp-per-block launch geometry";
         if(geometry.workerCount > poolMaxWorkers)
-            return "graph: geometry worker count exceeds the pool tracking capacity";
+            return "graph: workerCapacityExceeded: geometry worker count " + std::to_string(geometry.workerCount)
+                   + " exceeds the pool tracking capacity " + std::to_string(poolMaxWorkers);
 
         PacketPoolBudget budget = config.budget;
         if(budget.workers == 0u)
             budget.workers = geometry.workerCount;
         if(budget.workers > poolMaxWorkers)
-            return "graph: budget worker count exceeds the pool tracking capacity";
+            return "graph: workerCapacityExceeded: budget worker count " + std::to_string(budget.workers)
+                   + " exceeds the pool tracking capacity " + std::to_string(poolMaxWorkers);
         std::uint64_t const required = requiredSlots(budget);
         if(required > static_cast<std::uint64_t>(packetSlots))
             return "graph: packet pool capacity (" + std::to_string(packetSlots)
@@ -276,6 +288,8 @@ namespace graph
         std::uint32_t readyCapacity{0u};
         std::uint32_t packetCapacity{0u};
         std::uint32_t workerCount{0u};
+        /** Blocks that took the initializer branch. Must be exactly one. */
+        std::uint64_t initializerClaims{0u};
     };
 
     /** Result of one whole pool lifetime. */
@@ -346,6 +360,12 @@ namespace graph
             alignas(128) std::uint32_t initFailures{0u};
             alignas(128) std::uint32_t initWinner{0u};
             alignas(128) std::uint64_t initMaxSpin{0u};
+            /**
+             * Number of blocks that took the initializer branch. Exactly one
+             * block may initialize the ring and the packet pool; a higher value
+             * means the pool was re-configured underneath live owners.
+             */
+            alignas(128) std::uint64_t initializerClaims{0u};
             alignas(128) std::uint64_t execCounts[8]{};
             alignas(128) std::uint64_t retiredPackets{0u};
             alignas(128) std::uint64_t debugPolls{0u};

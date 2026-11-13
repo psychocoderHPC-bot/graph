@@ -127,7 +127,12 @@ namespace graph
             PoolDeviceState& state;
             PoolHostControl& host;
             PoolKernelArgs const& args;
-            std::uint32_t blockIndex;
+            /**
+             * Threads per block of this launch. The block index is *not* a
+             * member: it is passed by value into the functions that need it so
+             * every use reads the value the kernel derived from the
+             * accelerator, never a copy carried inside this aggregate.
+             */
             std::uint32_t blockThreads;
         };
 
@@ -315,24 +320,46 @@ namespace graph
         /** Publish one ready entry, retrying a transient lock contention.
          *
          * The ring lock is held only for a short critical section and is never
-         * held across a collective, so retrying the warp-uniform attempt is
-         * safe. A `Full` result is a hard capacity failure.
+         * held across a collective, so `Contended` is always retryable: the
+         * warp that owns the lock finishes and releases it. Only `Full` is a
+         * hard capacity failure.
+         *
+         * The attempt budget must cover a whole launch wave publishing at once
+         * (~900 warps on the A30). A smaller budget (4096) was exhausted under
+         * that contention and the caller reported a capacity error for a ring
+         * that was almost empty, which aborted the pool. The backoff runs every
+         * `pauseInterval` failures: pausing after *every* failure re-synchronizes
+         * the fleet into the same thundering herd that starved it.
          */
         template<typename T_Acc>
         ALPAKA_FN_ACC inline RingStatus enqueueWithRetry(
             SchedulerRuntime<T_Acc>& runtime,
             JobDescriptor const& entry) noexcept
         {
-            constexpr std::uint32_t maxAttempts = 4096u;
+            constexpr std::uint32_t maxAttempts = 1u << 20u;
+            constexpr std::uint32_t pauseInterval = 64u;
             RingStatus status = RingStatus::Contended;
             for(std::uint32_t attempt = 0u; attempt < maxAttempts; ++attempt)
             {
                 status = runtime.ring.enqueue(runtime.acc, runtime.warp, entry);
                 if(status != RingStatus::Contended)
                     return status;
-                devicePause(runtime.args.idleNanosleep);
+                if(attempt % pauseInterval == 0u)
+                    devicePause(runtime.args.idleNanosleep);
             }
             return status;
+        }
+
+        /** Error bit for a failed ready-ring publication.
+         *
+         * `Full` is the reserved-capacity failure the budget is sized against;
+         * an exhausted `Contended` budget is a scheduler livelock, which is a
+         * different, louder contract violation. Reporting contention as
+         * `readyRingFull` hides it behind a capacity error that never happened.
+         */
+        ALPAKA_FN_ACC inline std::uint32_t publicationError(RingStatus status) noexcept
+        {
+            return poolErrorBits(status == RingStatus::Full ? PoolError::readyRingFull : PoolError::internalState);
         }
 
         /** Acyclic quiescence check. Every worker may run it; the first
@@ -378,20 +405,32 @@ namespace graph
         template<typename T_Binder, typename T_Acc>
         ALPAKA_FN_ACC inline bool startupRendezvous(
             SchedulerRuntime<T_Acc>& runtime,
+            std::uint32_t blockIndex,
             std::uint64_t deadlineCycles,
             std::uint64_t /*deadlineIterations*/) noexcept
         {
             using Acc = typename SchedulerRuntime<T_Acc>::Acc;
-            // Block zero is the initializer. The launch is sized to one
-            // resident wave, and the deadline below turns a non-resident
-            // initializer into a reported startup failure instead of a hang.
-            bool const winner = runtime.blockIndex == 0u;
+            // Exactly one block initializes the ready ring and the packet pool.
+            // The role is decided from the block index the kernel derived from
+            // the accelerator and passes in *by value*; it must never be read
+            // back out of the `SchedulerRuntime` aggregate here. When the
+            // election is wrong every block runs `configure()`, whose per-slot
+            // record rewrite clobbers a packet record another block already
+            // handed out (the `{next, 0}` generation-0 abort) and relinks the
+            // free list underneath live owners. `initializerClaims` is a hard
+            // invariant: exactly one block may take this branch, and the
+            // ladder asserts it on every rung so a regression cannot hide as a
+            // silent re-configuration.
+            bool const winner = blockIndex == 0u;
+            if(winner && runtime.warp.isLeader())
+            {
+                runtime.state.initLock = 1u;
+                (void) addDevice(runtime.acc, &runtime.state.initializerClaims, std::uint64_t{1u});
+            }
 
             bool ready = true;
             if(winner)
             {
-                if(runtime.warp.isLeader())
-                    runtime.state.initLock = 1u;
                 runtime.ring.initialize(runtime.acc, runtime.warp);
                 if(runtime.warp.isLeader())
                 {
@@ -409,7 +448,7 @@ namespace graph
                     runtime.state.debugConfigured = configured ? 1u : 0u;
                     // One initializer writes the launch marker exactly once.
                     runtime.state.launchCount = 1u;
-                    runtime.state.initWinner = runtime.blockIndex;
+                    runtime.state.initWinner = blockIndex;
                     local.configured = configured ? 1u : 0u;
                     local.bound = T_Binder::bind(runtime.acc, runtime.table) ? 1u : 0u;
                     local.ready = (local.configured != 0u && local.bound != 0u) ? 1u : 0u;
@@ -440,25 +479,33 @@ namespace graph
             if(!winner)
             {
                 using Api = ALPAKA_TYPEOF(runtime.acc.getApi());
+                constexpr bool isCuda = std::is_same_v<std::remove_cvref_t<Api>, alpaka::api::Cuda>;
                 (void) deadlineCycles;
                 auto* initFlag = reinterpret_cast<std::uint64_t volatile*>(&runtime.state.initDone);
-                auto const cpuDeadline
-                    = std::chrono::steady_clock::now() + std::chrono::milliseconds{static_cast<std::int64_t>(5000)};
-                constexpr std::uint64_t maxCudaSpinIterations = 20'000'000u;
-                constexpr std::uint64_t maxCpuSpinIterations = 200'000'000u;
+                // The host deadline must never be *formed* on the device: a
+                // `__host__`-only clock read inside a device function is
+                // illegal, and the pinned toolchain only warns about it. Every
+                // non-initializing block takes this path, so it has to be
+                // device-legal, not merely unreached by the initializer.
+                std::chrono::steady_clock::time_point cpuDeadline{};
+                (void) cpuDeadline;
+#if !defined(__CUDA_ARCH__)
+                if constexpr(!isCuda)
+                    cpuDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{5000};
+#endif
+                constexpr std::uint64_t maxSpinIterations = isCuda ? 20'000'000u : 200'000'000u;
                 std::uint64_t iterations = 0u;
                 while(*initFlag == 0u)
                 {
-                    if constexpr(std::is_same_v<std::remove_cvref_t<Api>, alpaka::api::Cuda>)
+                    if(++iterations > maxSpinIterations)
+                        break;
+#if !defined(__CUDA_ARCH__)
+                    if constexpr(!isCuda)
                     {
-                        if(++iterations > maxCudaSpinIterations)
+                        if(std::chrono::steady_clock::now() > cpuDeadline)
                             break;
                     }
-                    else
-                    {
-                        if(std::chrono::steady_clock::now() > cpuDeadline || ++iterations > maxCpuSpinIterations)
-                            break;
-                    }
+#endif
                     devicePause(runtime.args.idleNanosleep);
                 }
                 runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
@@ -565,7 +612,7 @@ namespace graph
                 {
                     if(runtime.warp.isLeader())
                     {
-                        recordError(runtime, PoolError::readyRingFull);
+                        orDevice(runtime.acc, &runtime.state.errorWord, publicationError(status));
                         requestStop(runtime, poolStoppingAborted);
                     }
                     return;
@@ -750,7 +797,7 @@ namespace graph
                         if(status != RingStatus::Accepted)
                         {
                             if(runtime.warp.isLeader())
-                                recordError(runtime, PoolError::readyRingFull);
+                                orDevice(runtime.acc, &runtime.state.errorWord, publicationError(status));
                             ok = false;
                         }
                     }
@@ -787,7 +834,7 @@ namespace graph
                 if(status != RingStatus::Accepted)
                 {
                     if(runtime.warp.isLeader())
-                        recordError(runtime, PoolError::readyRingFull);
+                        orDevice(runtime.acc, &runtime.state.errorWord, publicationError(status));
                     ok = false;
                 }
             }
@@ -844,7 +891,7 @@ namespace graph
 
         /** The persistent scheduling loop of one worker warp. */
         template<typename T_Acc>
-        ALPAKA_FN_ACC inline void schedulerLoop(SchedulerRuntime<T_Acc>& runtime) noexcept
+        ALPAKA_FN_ACC inline void schedulerLoop(SchedulerRuntime<T_Acc>& runtime, std::uint32_t blockIndex) noexcept
         {
             std::uint64_t idleIterations = 0u;
             while(true)
@@ -853,7 +900,7 @@ namespace graph
                     return;
 
                 bool didWork = false;
-                if(runtime.blockIndex == 0u)
+                if(blockIndex == 0u)
                 {
                     importerStep(runtime);
                     // Uniform across the warp: every lane observes the mapped
@@ -881,8 +928,8 @@ namespace graph
                     {
                         (void) addDevice(runtime.acc, &runtime.state.active, std::uint64_t{1u});
                         (void) addDevice(runtime.acc, &runtime.state.claimAttempts, std::uint64_t{1u});
-                        std::uint32_t const word = runtime.blockIndex / 64u;
-                        std::uint64_t const bit = std::uint64_t{1u} << (runtime.blockIndex % 64u);
+                        std::uint32_t const word = blockIndex / 64u;
+                        std::uint64_t const bit = std::uint64_t{1u} << (blockIndex % 64u);
                         (void) orDevice(runtime.acc, &runtime.state.workerBits[word], bit);
                     }
                     // Order the leader's acquire before any lane reads packet data.
@@ -899,11 +946,8 @@ namespace graph
                         if(executed && published)
                         {
                             (void) addDevice(runtime.acc, &runtime.state.completedJobs, std::uint64_t{1u});
-                            std::uint64_t const local = ++runtime.state.workerRetired[runtime.blockIndex];
-                            graph::systemStoreRelease(
-                                runtime.acc,
-                                &runtime.host.workerRetired[runtime.blockIndex],
-                                local);
+                            std::uint64_t const local = ++runtime.state.workerRetired[blockIndex];
+                            graph::systemStoreRelease(runtime.acc, &runtime.host.workerRetired[blockIndex], local);
                             (void) addDevice(runtime.acc, &runtime.state.outstanding, std::uint64_t{0u} - 1u);
                         }
                         else
@@ -958,6 +1002,27 @@ namespace graph
                 auto const blockIndex = static_cast<std::uint32_t>(
                     acc.getIdxWithin(alpaka::onAcc::origin::grid, alpaka::onAcc::unit::blocks)[0]);
 
+                // Loud capacity guard: every per-worker array in the device
+                // state (`blockPhase`, `workerRetired`, `workerBits`) is sized
+                // by `poolMaxWorkers` and indexed by the block index. A geometry
+                // beyond that capacity is rejected here, before any index is
+                // formed, so it is never accepted and then indexed out of range.
+                if(blockIndex >= static_cast<std::uint32_t>(poolMaxWorkers))
+                {
+                    if(warp.isLeader())
+                    {
+                        orDevice(
+                            acc,
+                            &static_cast<PoolDeviceState*>(args.state)->errorWord,
+                            poolErrorBits(PoolError::workerCapacityExceeded));
+                        (void) exchangeDevice(
+                            acc,
+                            &static_cast<PoolDeviceState*>(args.state)->stopReason,
+                            poolStoppingAborted);
+                    }
+                    return;
+                }
+
                 if(warp.isLeader())
                 {
                     static_cast<PoolDeviceState*>(args.state)->debugBlockThreads = blockThreads;
@@ -988,14 +1053,16 @@ namespace graph
                     *static_cast<PoolDeviceState*>(args.state),
                     *args.hostControl,
                     args,
-                    blockIndex,
                     blockThreads};
 
-                bool const started
-                    = startupRendezvous<T_Binder>(runtime, args.initDeadlineCycles, args.initDeadlineIterations);
+                bool const started = startupRendezvous<T_Binder>(
+                    runtime,
+                    blockIndex,
+                    args.initDeadlineCycles,
+                    args.initDeadlineIterations);
                 if(!started)
                     return;
-                schedulerLoop(runtime);
+                schedulerLoop(runtime, blockIndex);
             }
         };
     } // namespace detail

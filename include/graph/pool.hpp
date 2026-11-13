@@ -730,6 +730,7 @@ namespace graph
                 snapshot.readyCapacity = static_cast<std::uint32_t>(poolReadyCapacity);
                 snapshot.packetCapacity = static_cast<std::uint32_t>(poolPacketSlotCapacity);
                 snapshot.workerCount = m_geometry.workerCount;
+                snapshot.initializerClaims = state->initializerClaims;
 
                 PoolResult result;
                 result.counters = snapshot;
