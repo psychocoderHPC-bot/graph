@@ -9,6 +9,7 @@
 #include <graph/detail/operation.hpp>
 #include <graph/detail/packet.hpp>
 #include <graph/detail/views.hpp>
+#include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
 #include <graph/graph_model.hpp>
 
@@ -584,12 +585,26 @@ namespace graph::toy
                         plan.errorFlags |= toyErrorIdOutOfRange;
                 }
             }
+            // The plan was produced in a leader-only region. A shuffle does
+            // not reconverge a warp that region split, so synchronize before
+            // broadcasting `emitted`; otherwise a non-leader lane can start a
+            // count-dependent loop with a garbage value.
+            {
+                auto const blockThreads = static_cast<std::uint32_t>(
+                    acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
+            }
             std::uint32_t const emitted = warp.template broadcast<std::uint32_t>(plan.emitted, 0u);
             std::uint32_t const idLimit = control != nullptr ? control->idLimit : 0u;
             std::uint32_t const width = warp.workerWidth();
             std::uint32_t localErrors = toyErrorNone;
-            for(std::uint32_t i = warp.laneIndex(); i < emitted; i += width)
+            std::uint32_t const rounds = (emitted + width - 1u) / width;
+            for(std::uint32_t round = 0u; round < rounds; ++round)
             {
+                std::uint32_t const i = round * width + warp.laneIndex();
+                if(i >= emitted)
+                    continue;
                 std::uint64_t const id = job.request.firstId + i;
                 if(!toyIdInRange(id, idLimit))
                     localErrors |= toyErrorIdOutOfRange;
@@ -617,8 +632,12 @@ namespace graph::toy
             std::uint32_t localErrors = toyErrorNone;
             if(count > output.size())
                 localErrors |= toyErrorOutputOverflow;
-            for(std::uint32_t i = warp.laneIndex(); i < count; i += width)
+            std::uint32_t const rounds = (count + width - 1u) / width;
+            for(std::uint32_t round = 0u; round < rounds; ++round)
             {
+                std::uint32_t const i = round * width + warp.laneIndex();
+                if(i >= count)
+                    continue;
                 ToyItem item = input.read(i);
                 if(!toyIdInRange(item.id, idLimit))
                     localErrors |= toyErrorIdOutOfRange;
@@ -774,8 +793,12 @@ namespace graph::toy
             WarpGroup<T_Acc> const warp{acc};
             std::uint32_t const width = warp.workerWidth();
             std::uint32_t localErrors = toyErrorNone;
-            for(std::uint32_t i = warp.laneIndex(); i < count; i += width)
+            std::uint32_t const rounds = (count + width - 1u) / width;
+            for(std::uint32_t round = 0u; round < rounds; ++round)
             {
+                std::uint32_t const i = round * width + warp.laneIndex();
+                if(i >= count)
+                    continue;
                 ToyItem const item = input.read(i);
                 if(control == nullptr || control->results == nullptr || control->sinkWrites == nullptr
                    || item.id >= static_cast<std::uint64_t>(slots))

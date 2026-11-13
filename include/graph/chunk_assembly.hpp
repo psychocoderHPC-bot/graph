@@ -362,6 +362,13 @@ namespace graph
                     ok = true;
                 }
             }
+            // A leader-only region can leave the warp in two convergence
+            // groups under CUDA's independent thread scheduling. Shuffles do
+            // not reconverge them, so synchronize before the broadcast.
+            auto const blockThreads = static_cast<std::uint32_t>(
+                acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+            WarpBarrier<T_Acc> convergence{};
+            convergence.barrier(acc, blockThreads, warp);
             return broadcastBool(warp, ok);
         }
 
@@ -454,6 +461,12 @@ namespace graph
                 {
                     status = static_cast<std::uint32_t>(FlushStatus::InvalidOwnerToken);
                 }
+            }
+            // Reconverge after the leader-only claim/apply region before any
+            // shuffle distributes the result.
+            {
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
             }
             status = warp.template broadcast<std::uint32_t>(status, 0u);
             result.slot = warp.template broadcast<std::uint32_t>(result.slot, 0u);
@@ -644,6 +657,14 @@ namespace graph
                 status = static_cast<std::uint32_t>(result);
                 m_status = result == AppendStatus::Ok ? Status::Pending : Status::Failed;
             }
+            // Reconverge after the leader-only reserve region before the
+            // shuffles that distribute the plan.
+            {
+                auto const blockThreads = static_cast<std::uint32_t>(
+                    acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
+            }
             status = warp.template broadcast<std::uint32_t>(status, 0u);
             m_targetCount = warp.template broadcast<std::uint32_t>(m_targetCount, 0u);
             m_ownerToken = warp.template broadcast<std::uint32_t>(m_ownerToken, 0u);
@@ -785,6 +806,12 @@ namespace graph
                     m_status = ok ? Status::Committed : Status::Failed;
                 }
             }
+            // Reconverge after the leader-only apply region before the result
+            // is distributed through a shuffle.
+            {
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
+            }
             ok = warp.template broadcast<std::uint32_t>(ok ? 1u : 0u, 0u) != 0u;
             m_status = static_cast<Status>(
                 warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(m_status), 0u));
@@ -812,6 +839,14 @@ namespace graph
                     }
                 }
                 m_status = Status::Cancelled;
+            }
+            // Reconverge after the leader-only claim release before the status
+            // shuffle.
+            {
+                auto const blockThreads = static_cast<std::uint32_t>(
+                    acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
             }
             m_status = static_cast<Status>(
                 warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(m_status), 0u));

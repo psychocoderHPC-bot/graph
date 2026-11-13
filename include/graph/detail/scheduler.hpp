@@ -605,9 +605,9 @@ namespace graph
             if(leader)
             {
                 std::uint64_t const closed = loadDeviceAcquire(runtime.acc, &runtime.state.closedSeen);
-                std::uint64_t const pendingSources = loadDeviceRelaxed(runtime.acc, &runtime.state.pendingSources);
-                std::uint64_t const outstanding = loadDeviceRelaxed(runtime.acc, &runtime.state.outstanding);
-                std::uint64_t const staging = loadDeviceRelaxed(runtime.acc, &runtime.state.stagingCount);
+                std::uint64_t const pendingSources = loadDeviceAcquire(runtime.acc, &runtime.state.pendingSources);
+                std::uint64_t const outstanding = loadDeviceAcquire(runtime.acc, &runtime.state.outstanding);
+                std::uint64_t const staging = loadDeviceAcquire(runtime.acc, &runtime.state.stagingCount);
                 if(closed != 0u && pendingSources == 0u && outstanding == 0u && staging == 0u)
                 {
                     locked = alpaka::onAcc::atomicCas(
@@ -621,6 +621,8 @@ namespace graph
                                  : 0u;
                 }
             }
+            // Reconverge after the leader-only CAS before the shuffle.
+            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
             locked = warp.template broadcast<std::uint32_t>(locked, 0u);
             if(locked == 0u)
                 return false;
@@ -630,9 +632,9 @@ namespace graph
             if(leader)
             {
                 std::uint64_t const closed = loadDeviceAcquire(runtime.acc, &runtime.state.closedSeen);
-                std::uint64_t const pendingSources = loadDeviceRelaxed(runtime.acc, &runtime.state.pendingSources);
-                std::uint64_t const outstanding = loadDeviceRelaxed(runtime.acc, &runtime.state.outstanding);
-                std::uint64_t const staging = loadDeviceRelaxed(runtime.acc, &runtime.state.stagingCount);
+                std::uint64_t const pendingSources = loadDeviceAcquire(runtime.acc, &runtime.state.pendingSources);
+                std::uint64_t const outstanding = loadDeviceAcquire(runtime.acc, &runtime.state.outstanding);
+                std::uint64_t const staging = loadDeviceAcquire(runtime.acc, &runtime.state.stagingCount);
                 if(closed != 0u && pendingSources == 0u && outstanding == 0u && staging == 0u)
                 {
                     std::uint64_t const packetViolations = runtime.pool.ownershipViolations();
@@ -650,6 +652,14 @@ namespace graph
                     }
                     else
                     {
+                        // Pair with the release fence of the last commit before
+                        // reading the stream counters. Without it a drain scan
+                        // can miss a just-committed partial buffer and stop the
+                        // pool with data still buffered.
+                        alpaka::onAcc::memFence(
+                            runtime.acc,
+                            alpaka::onAcc::scope::device,
+                            alpaka::onAcc::order::acquire);
                         Assembly assembler = makeAssembly(runtime);
                         std::uint64_t partials = 0u;
                         for(std::uint32_t index = 0u; index < assembler.streamCount(); ++index)
@@ -666,6 +676,9 @@ namespace graph
                     }
                 }
             }
+            // Reconverge after the leader-only observation before distributing
+            // the decision through shuffles.
+            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
             action = warp.template broadcast<std::uint32_t>(action, 0u);
             drainStream = warp.template broadcast<std::uint32_t>(drainStream, 0u);
 
@@ -1291,6 +1304,13 @@ namespace graph
                 return false;
             }
             function(runtime.acc, job, accessor);
+            // The functor contains leader-only regions and lane-strided loops;
+            // under CUDA's independent thread scheduling the warp can return
+            // from the indirect call split. Converge before any lane reads a
+            // per-lane count or runs a count-dependent loop, or the leader can
+            // reach the next block barrier while other lanes are still in a
+            // count-dependent loop.
+            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
             if(leader && job.operation.value < 8u)
                 (void) addDevice(runtime.acc, &runtime.state.execCounts[job.operation.value], std::uint64_t{1u});
 
@@ -1313,7 +1333,10 @@ namespace graph
                         recordError(runtime, PoolError::packetExceedsCapacity);
                     return false;
                 }
-                std::uint32_t const count = accessor.outputCount(port);
+                // The functor reports a warp-uniform count; broadcast it so
+                // every lane uses the same value even if a backend keeps the
+                // mutable accessor copy in per-lane local memory.
+                std::uint32_t const count = warp.template broadcast<std::uint32_t>(accessor.outputCount(port), 0u);
                 if(count == 0u)
                     continue;
                 if(count > runtime.args.chunkCapacity || requestCount >= maxAssemblyTargets)
@@ -1355,7 +1378,6 @@ namespace graph
                 configureChunkRecord(runtime, replacement);
                 replacements[request] = makeAssemblySlot(replacement, capacityBytes);
             }
-
             AssemblySlot publications[maxAssemblyTargets]{};
             AssemblyReservation reservation{};
             bool committed = false;
@@ -1391,8 +1413,18 @@ namespace graph
                 for(std::uint32_t target = 0u; target < requestCount; ++target)
                 {
                     auto* source = static_cast<AssemblyElement*>(accessor.outputData[requestPorts[target]]);
-                    for(std::uint32_t byte = warp.laneIndex(); byte < requests[target].itemCount; byte += width)
+                    // A uniform round count keeps every lane in the same loop
+                    // iteration. A lane-strided `byte < itemCount` loop can
+                    // leave lanes at different program points under CUDA's
+                    // independent thread scheduling, and the following
+                    // block barrier would then wait for lanes that never
+                    // arrive.
+                    std::uint32_t const rounds = (requests[target].itemCount + width - 1u) / width;
+                    for(std::uint32_t round = 0u; round < rounds; ++round)
                     {
+                        std::uint32_t const byte = round * width + warp.laneIndex();
+                        if(byte >= requests[target].itemCount)
+                            continue;
                         AssemblyElement* destination = reservation.writePointer(target, byte);
                         if(destination == nullptr)
                             copyOk = false;
@@ -1524,24 +1556,28 @@ namespace graph
             while(true)
             {
                 if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
+                {
+                    if(runtime.warp.isLeader())
+                        return;
+                }
+
+                // Every worker honors the mapped host abort word, not only the
+                // importer block. A diagnostic abort must stop a stuck idle
+                // worker as well, and the read is warp-uniform on every lane.
+                if(hostAbortRequested(runtime))
+                {
+                    if(runtime.warp.isLeader())
+                    {
+                        recordError(runtime, PoolError::aborted);
+                        requestStop(runtime, poolStoppingAborted, 6u);
+                    }
                     return;
+                }
 
                 bool didWork = false;
                 if(blockIndex == 0u)
                 {
                     importerStep(runtime);
-                    // Uniform across the warp: every lane observes the mapped
-                    // abort word, so the branch cannot diverge before the next
-                    // collective.
-                    bool const hostAborted = hostAbortRequested(runtime);
-                    if(hostAborted)
-                    {
-                        if(runtime.warp.isLeader())
-                        {
-                            recordError(runtime, PoolError::aborted);
-                            requestStop(runtime, poolStoppingAborted, 6u);
-                        }
-                    }
                     if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
                         return;
                 }
