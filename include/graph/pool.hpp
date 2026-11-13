@@ -367,6 +367,16 @@ namespace graph
                                              : std::max(defaultKernelRegisters, fallbackKernelRegisters);
                 auto const environment = queryLaunchEnvironment(m_device, registerHint);
                 m_geometry = computeLaunchGeometry(environment.props, LaunchPolicy{});
+                // Test-only worker cap. It only lowers the geometry, so the
+                // single-wave check below still holds; `PoolConfig::testWorkerLimit`
+                // is documented as a test knob, not a public API.
+                if(m_config.testWorkerLimit != 0u)
+                {
+                    if(m_config.testWorkerLimit > m_geometry.workerCount)
+                        throw std::invalid_argument("graph::startPool: testWorkerLimit exceeds the launch geometry");
+                    m_geometry.blocks = m_config.testWorkerLimit * m_geometry.warpsPerBlock;
+                    m_geometry.workerCount = m_config.testWorkerLimit * m_geometry.warpsPerBlock;
+                }
                 auto const validation = validateSingleWave(m_geometry, environment.props, environment.limits);
                 if(!validation.singleWave)
                     throw std::runtime_error(
@@ -698,6 +708,10 @@ namespace graph
                 snapshot.claimAttempts = state->claimAttempts;
                 snapshot.distinctWorkers = distinctWorkers;
                 snapshot.launchCount = state->launchCount;
+                snapshot.retiredPackets = state->retiredPackets;
+                snapshot.importPolls = state->debugPolls;
+                snapshot.importBlockedPolls = state->debugImportBlocked;
+                snapshot.importEmptyPolls = state->debugImportEmpty;
                 snapshot.readyViolations = state->readyViolations + header.violations;
                 snapshot.errorWord = state->errorWord;
                 snapshot.stopReason = static_cast<std::uint32_t>(state->stopReason);

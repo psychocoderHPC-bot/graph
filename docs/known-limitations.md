@@ -15,17 +15,43 @@ arbitrary binder, so `startPool()` keeps the 128-register floor on top of the ca
 (896 blocks) unless `PoolConfig::registerHint` names a measured binder value. The open item is a
 capture that includes a representative binder, or a per-instantiation occupancy check.
 
-## CUDA pool repeat fails on the packet-pool free list
-The CUDA `-R pool` repeat fails on the branch. `test_pool_gpu.cpp` aborts with
-`errorWord 0x240` (aborted plus internal scheduler state) when `packetHandleValid` drops a job: the
-slot record still holds its free-list value (generation 0, index = next free slot) while the ready
-entry carries the acquired generation. The pool-visible evidence is a free-list head that does not
-advance (the same slot index is handed out twice, generation 1 then 2) and a ready-ring
-`pushCounter - claimCounter` that underflows. This is a cross-warp visibility problem in the
-packet-pool header, not the packet-handle defect: the successor path now carries the descriptor's
-handle correctly. `test_pool_probes.cpp` finds mismatches only on the ring and pool headers, not in
-the broadcast of the descriptor. The defect is not fixed on this branch and the CUDA pool cases are
-therefore not a passing gate.
+## Shuffle-based broadcast does not reconverge a split warp
+The pinned alpaka implements `alpaka::onAcc::warp::shfl` as
+`__shfl_sync(__activemask(), value, srcLane, width)`. `__activemask()` reports the lanes that are
+converged *at that call site*; it does not reconverge the warp. After a leader-only region that the
+compiler does not bracket with a reconvergence point, the leader and the remaining lanes stay in two
+convergence groups and every later shuffle returns the caller's own value. Measured on the A30 with
+a 32-thread block: immediately after `PacketPool::acquire` (whose leader-only CAS retry loop is the
+trigger) lane 0 reports `__activemask() == 0x1` and lanes 1..31 report `0xfffffffe`; a following
+`shfl` of a leader value delivers nothing to the other lanes, while the same shuffle before the
+`acquire` works. That single defect explained the `imported < accepted` stall, the `errorWord 0x240`
+abort, the all-wrong sink slots, and probe 3.
+
+The pool no longer depends on a shuffle for any decision: the ready-ring claim result, the
+packet-pool claim/release/configure result, and the importer/startup control values travel through
+`graph::WarpHandoff` (one block-shared slot, written by lane 0, followed by `syncBlockThreads`, read
+by every lane). The remaining shuffle users are functors and the chunk-assembly code, which call a
+broadcast only in uniform control flow. The gate for reintroducing shuffles into a leader-then-
+collective path is a broadcast primitive that passes an explicit full mask plus a warp convergence
+point; the pinned alpaka does not provide one.
+
+## Full-geometry CUDA pool still aborts above 192 workers
+The shuffle defect above is fixed and the correctness ladder
+(`tests/integration/test_pool_ladder_gpu.cpp`) is green up to 192 workers, but the pool still aborts
+at 256 workers and above, including the full 896-worker geometry. The signature is stable:
+`errorWord 0x240` (`internalState` plus `aborted`), `debugStopStage 2` (`executeJob` returned false),
+`imported` stops at the first `maxImportBatch` batch, and the sink accounting is
+`correct=0 duplicated=0 missing=N`. The job that trips the abort carries a handle that a successful
+`PacketPool::acquire` issued, while the slot record read back by the executing block still holds its
+initial free-list value (`{next slot, generation 0}`), i.e. the state `configure()` wrote.
+
+Ruled out so far, each with a direct measurement on the A30: descriptor distribution (probe 3 is
+green and no pool decision uses a shuffle), the claim handoff (leader value and block-shared read
+agree), concurrent pool configuration (a mapped per-block marker in `PoolHostControl::blockPhase`
+shows exactly one initializing block in every rung), and weak-load staleness (the record reads are
+`ld.acquire.gpu` acquire loads through `detail::dev::loadAcquire`). The remaining suspects are the
+packet-pool record publication/hand-out and the free-list walk under >=256 concurrent warps; the
+gate is the ladder rung 7 with `correct=N, duplicated=0, missing=0` and a 20x `-R pool` repeat.
 
 ## Multi-warp-per-block is refused by design
 `WarpBarrier::barrier()` maps to a block-wide barrier only when the block holds exactly one warp.

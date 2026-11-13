@@ -6,6 +6,7 @@
 #include <alpaka/alpaka.hpp>
 
 #include <graph/detail/config.hpp>
+#include <graph/detail/device_atomic.hpp>
 #include <graph/detail/job.hpp>
 #include <graph/detail/launch.hpp>
 #include <graph/detail/operation.hpp>
@@ -141,6 +142,13 @@ namespace graph
          * port (`maxPacketPorts - 1`). The pool never dereferences it.
          */
         void* controlBlock{nullptr};
+        /**
+         * Test-only: cap the persistent worker warps (0 = use the full launch
+         * geometry). Not part of the public API. It exists so the GPU
+         * correctness ladder can force a reproducible worker count per rung;
+         * the value only ever reduces the geometry, never raises it.
+         */
+        std::uint32_t testWorkerLimit{0u};
         /** Device buffer exposed through `copyResultsToHost`. */
         void* resultDevice{nullptr};
         /** Byte size of `resultDevice`. */
@@ -244,6 +252,14 @@ namespace graph
         std::uint64_t distinctWorkers{0u};
         std::uint64_t launchCount{0u};
         std::uint64_t readyViolations{0u};
+        /** Jobs retired by a node without outgoing edges. */
+        std::uint64_t retiredPackets{0u};
+        /** Importer loop iterations that polled for ingress. */
+        std::uint64_t importPolls{0u};
+        /** Importer poll phases skipped because the ready ring/pool had no room. */
+        std::uint64_t importBlockedPolls{0u};
+        /** Importer polls that found no new descriptor. */
+        std::uint64_t importEmptyPolls{0u};
         std::uint32_t errorWord{0u};
         std::uint32_t stopReason{0u};
         std::uint32_t initFailures{0u};
@@ -334,6 +350,8 @@ namespace graph
             alignas(128) std::uint64_t retiredPackets{0u};
             alignas(128) std::uint64_t debugPolls{0u};
             alignas(128) std::uint64_t debugDispatches{0u};
+            alignas(128) std::uint64_t debugImportBlocked{0u};
+            alignas(128) std::uint64_t debugImportEmpty{0u};
             alignas(128) std::uint32_t blockPhase[poolMaxWorkers]{};
             alignas(128) std::uint64_t workerRetired[poolMaxWorkers]{};
             alignas(128) std::uint32_t debugBlockThreads{0u};
@@ -441,77 +459,6 @@ namespace graph
         inline constexpr std::uint64_t poolStoppingNone = 0u;
         inline constexpr std::uint64_t poolStoppingDrained = 1u;
         inline constexpr std::uint64_t poolStoppingAborted = 2u;
-
-        namespace dev
-        {
-#if GRAPH_HAS_CUDA
-            template<typename T>
-            ALPAKA_FN_ACC inline T loadRelaxed(T const* pointer) noexcept
-            {
-                ::cuda::atomic_ref<T, ::cuda::thread_scope_device> ref(*const_cast<T*>(pointer));
-                return ref.load(::cuda::std::memory_order_relaxed);
-            }
-
-            template<typename T>
-            ALPAKA_FN_ACC inline T loadAcquire(T const* pointer) noexcept
-            {
-                ::cuda::atomic_ref<T, ::cuda::thread_scope_device> ref(*const_cast<T*>(pointer));
-                return ref.load(::cuda::std::memory_order_acquire);
-            }
-
-            template<typename T>
-            ALPAKA_FN_ACC inline void storeRelease(T* pointer, T value) noexcept
-            {
-                ::cuda::atomic_ref<T, ::cuda::thread_scope_device> ref(*pointer);
-                ref.store(value, ::cuda::std::memory_order_release);
-            }
-#else
-            template<typename T>
-            ALPAKA_FN_ACC inline T loadRelaxed(T const* pointer) noexcept
-            {
-                std::atomic_ref<T> ref(*const_cast<T*>(pointer));
-                return ref.load(std::memory_order_relaxed);
-            }
-
-            template<typename T>
-            ALPAKA_FN_ACC inline T loadAcquire(T const* pointer) noexcept
-            {
-                std::atomic_ref<T> ref(*const_cast<T*>(pointer));
-                return ref.load(std::memory_order_acquire);
-            }
-
-            template<typename T>
-            ALPAKA_FN_ACC inline void storeRelease(T* pointer, T value) noexcept
-            {
-                std::atomic_ref<T> ref(*pointer);
-                ref.store(value, std::memory_order_release);
-            }
-#endif
-        } // namespace dev
-
-        /** Device-scope relaxed load of a scheduler counter. */
-        template<typename T_Acc, typename T>
-        ALPAKA_FN_ACC inline T loadDeviceRelaxed(T_Acc const& acc, T const* pointer) noexcept
-        {
-            (void) acc;
-            return dev::loadRelaxed(pointer);
-        }
-
-        /** Device-scope acquire load. */
-        template<typename T_Acc, typename T>
-        ALPAKA_FN_ACC inline T loadDeviceAcquire(T_Acc const& acc, T const* pointer) noexcept
-        {
-            (void) acc;
-            return dev::loadAcquire(pointer);
-        }
-
-        /** Device-scope release store. */
-        template<typename T_Acc, typename T>
-        ALPAKA_FN_ACC inline void storeDeviceRelease(T_Acc const& acc, T* pointer, T value) noexcept
-        {
-            (void) acc;
-            dev::storeRelease(pointer, value);
-        }
 
         /** Device-scope atomic add. */
         template<typename T_Acc, typename T>

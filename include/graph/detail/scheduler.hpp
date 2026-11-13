@@ -12,6 +12,7 @@
 #include <graph/detail/rendezvous.hpp>
 #include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
+#include <graph/detail/warp_handoff.hpp>
 #include <graph/graph_model.hpp>
 #include <graph/ingress_ring.hpp>
 #include <graph/packet_pool.hpp>
@@ -151,14 +152,43 @@ namespace graph
             orDevice(runtime.acc, &runtime.state.errorWord, poolErrorBits(error));
         }
 
-        /** Warp-uniform broadcast of a 32-bit value from the leader. */
-        template<typename T_Acc>
-        ALPAKA_FN_ACC inline std::uint32_t broadcastU32(
-            SchedulerRuntime<T_Acc> const& runtime,
-            std::uint32_t value) noexcept
+        /** Leader-published state of the importer's dispatch decision.
+         *
+         * Distributed through `WarpHandoff`, not a shuffle: the decision
+         * follows a leader-only read of the staging state, and the pinned
+         * alpaka's shuffle does not reconverge a warp that a leader-only region
+         * split.
+         */
+        struct ImportDispatch
         {
-            return runtime.warp.template broadcast<std::uint32_t>(value, 0u);
-        }
+            std::uint32_t stagingCount{0u};
+            std::uint32_t stagingHead{0u};
+            std::uint32_t hasRoom{0u};
+        };
+
+        static_assert(std::is_trivially_copyable_v<ImportDispatch>);
+        static_assert(std::is_standard_layout_v<ImportDispatch>);
+
+        /** Leader-published outcome of one ingress poll. */
+        struct ImportPoll
+        {
+            ImportStatus status{ImportStatus::nothing_new};
+            std::uint32_t imported{0u};
+        };
+
+        static_assert(std::is_trivially_copyable_v<ImportPoll>);
+        static_assert(std::is_standard_layout_v<ImportPoll>);
+
+        /** Leader-published outcome of the startup configuration. */
+        struct StartupState
+        {
+            std::uint32_t configured{1u};
+            std::uint32_t bound{1u};
+            std::uint32_t ready{1u};
+        };
+
+        static_assert(std::is_trivially_copyable_v<StartupState>);
+        static_assert(std::is_standard_layout_v<StartupState>);
 
         /** Overwrite the packet-pool record of a freshly acquired slot.
          *
@@ -269,14 +299,14 @@ namespace graph
                     recordError(runtime, PoolError::internalState);
                 return false;
             }
-            PacketRecord const& record = runtime.pool.slotRecord(handle);
             // Ownership is carried by the generation: the slot is owned by this
             // handle iff the pool's current generation for that index equals the
-            // generation broadcast with the descriptor. `elementCount` is not an
+            // generation carried by the descriptor. `elementCount` is not an
             // ownership signal: under a deliberately small pool a valid in-flight
             // job can be claimed while its payload is not yet fully configured,
-            // so a zero elementCount must not drop the job.
-            bool const matches = record.handle.generation == handle.generation;
+            // so a zero elementCount must not drop the job. The read is an
+            // acquire load because another block's claim published the record.
+            bool const matches = runtime.pool.observedGeneration(runtime.acc, handle.index) == handle.generation;
             if(!matches && runtime.warp.isLeader())
                 (void) addDevice(runtime.acc, &runtime.state.readyViolations, std::uint64_t{1u});
             return matches;
@@ -351,6 +381,7 @@ namespace graph
             std::uint64_t deadlineCycles,
             std::uint64_t /*deadlineIterations*/) noexcept
         {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
             // Block zero is the initializer. The launch is sized to one
             // resident wave, and the deadline below turns a non-resident
             // initializer into a reported startup failure instead of a hang.
@@ -367,27 +398,29 @@ namespace graph
                     runtime.state.debugRequiredSlots = requiredSlots(runtime.args.budget);
                     runtime.state.debugBudgetWorkers = runtime.args.budget.workers;
                 }
-                bool configured = runtime.pool.configure(runtime.acc, runtime.warp, runtime.args.budget);
-                bool bound = false;
+                bool const configured = runtime.pool.configure(runtime.acc, runtime.warp, runtime.args.budget);
+                // The pool configure already distributed `configured` through
+                // its own handoff; the remaining startup flags follow through a
+                // second handoff so no lane depends on a shuffle.
+                WarpHandoff<Acc, StartupState, handoff_id::schedulerStartup> handoff;
+                StartupState local{};
                 if(runtime.warp.isLeader())
                 {
                     runtime.state.debugConfigured = configured ? 1u : 0u;
                     // One initializer writes the launch marker exactly once.
                     runtime.state.launchCount = 1u;
                     runtime.state.initWinner = runtime.blockIndex;
-                    bound = T_Binder::bind(runtime.acc, runtime.table);
-                }
-                configured = broadcastU32(runtime, configured ? 1u : 0u) != 0u;
-                bound = broadcastU32(runtime, bound ? 1u : 0u) != 0u;
-                if(runtime.warp.isLeader())
-                {
-                    if(!configured)
+                    local.configured = configured ? 1u : 0u;
+                    local.bound = T_Binder::bind(runtime.acc, runtime.table) ? 1u : 0u;
+                    local.ready = (local.configured != 0u && local.bound != 0u) ? 1u : 0u;
+                    if(local.configured == 0u)
                         recordError(runtime, PoolError::internalState);
-                    if(!bound)
+                    if(local.bound == 0u)
                         recordError(runtime, PoolError::unknownOperation);
-                    ready = configured && bound;
                 }
-                ready = broadcastU32(runtime, ready ? 1u : 0u) != 0u;
+                handoff.publish(runtime.acc, runtime.warp, local);
+                handoff.sync(runtime.acc);
+                ready = handoff.get(runtime.acc).ready != 0u;
                 // Publish every table and ring store before any worker reads.
                 // A device-scope release fence followed by a volatile store is
                 // the publication pattern validated by the ready-ring and
@@ -456,40 +489,53 @@ namespace graph
             return true;
         }
 
-        /** Give ingress a bounded opportunity and dispatch already staged jobs. */
+        /** Give ingress a bounded opportunity and dispatch already staged jobs.
+         *
+         * Every decision the other lanes need is published by the importer
+         * leader through a block-shared handoff and read after a block barrier.
+         * There is **no** leader-only `return` in this function: a lane that
+         * returned while the rest of the warp still had to reach a barrier
+         * desynchronized the block's barrier accounting and stalled the
+         * importer after a few jobs.
+         */
         template<typename T_Acc>
         ALPAKA_FN_ACC inline void importerStep(SchedulerRuntime<T_Acc>& runtime) noexcept
         {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
+            using DispatchHandoff = WarpHandoff<Acc, ImportDispatch, handoff_id::schedulerImport>;
+            using PollHandoff = WarpHandoff<Acc, ImportPoll, handoff_id::schedulerImport + 1u>;
+
             if(runtime.warp.isLeader())
             {
                 std::uint64_t const polls = addDevice(runtime.acc, &runtime.state.debugPolls, std::uint64_t{1u}) + 1u;
                 graph::systemStoreRelease(runtime.acc, &runtime.host.polls, polls);
             }
+
             // Dispatch staged descriptors first: the importer acknowledged them
             // already, so they are accounted as outstanding.
             for(std::uint32_t dispatched = 0u; dispatched < runtime.args.importPerIteration; ++dispatched)
             {
-                std::uint32_t count = 0u;
-                std::uint32_t head = 0u;
+                ImportDispatch local{};
                 if(runtime.warp.isLeader())
                 {
-                    count = runtime.state.stagingCount;
-                    head = runtime.state.stagingHead;
+                    local.stagingCount = runtime.state.stagingCount;
+                    local.stagingHead = runtime.state.stagingHead;
+                    local.hasRoom = (runtime.ring.inFlightCount() < runtime.args.readySoftLimit
+                                     && runtime.pool.freeCount() > runtime.args.workers)
+                                        ? 1u
+                                        : 0u;
                 }
-                count = broadcastU32(runtime, count);
-                head = broadcastU32(runtime, head);
-                if(count == 0u)
+                DispatchHandoff handoff;
+                handoff.publish(runtime.acc, runtime.warp, local);
+                handoff.sync(runtime.acc);
+                ImportDispatch const state = handoff.get(runtime.acc);
+                if(state.stagingCount == 0u || state.hasRoom == 0u)
                     break;
 
-                bool hasRoom = false;
-                if(runtime.warp.isLeader())
-                    hasRoom = runtime.ring.inFlightCount() < runtime.args.readySoftLimit
-                              && runtime.pool.freeCount() > runtime.args.workers;
-                hasRoom = broadcastU32(runtime, hasRoom ? 1u : 0u) != 0u;
-                if(!hasRoom)
-                    break;
-
-                JobDescriptor const staged = runtime.args.staging[head];
+                // Only the importer leader mutates the staging area, and it is
+                // not writing during the dispatch phase, so the descriptor is
+                // stable while every lane reads it.
+                JobDescriptor const staged = runtime.args.staging[state.stagingHead];
                 PacketHandle handle{};
                 if(!acquireWithRetry(runtime, handle))
                 {
@@ -538,22 +584,36 @@ namespace graph
                 }
             }
 
-            std::uint32_t staged = 0u;
-            if(runtime.warp.isLeader())
-                staged = runtime.state.stagingCount;
-            staged = broadcastU32(runtime, staged);
-            if(staged != 0u)
-                return;
+            // Re-publish the staging state and the room decision for the poll
+            // phase; the barrier also orders the leader's staging writes above
+            // against any lane that reads staging in the next iteration.
+            {
+                ImportDispatch local{};
+                if(runtime.warp.isLeader())
+                {
+                    local.stagingCount = runtime.state.stagingCount;
+                    local.hasRoom = (runtime.ring.inFlightCount() < runtime.args.readySoftLimit
+                                     && runtime.pool.freeCount() > runtime.args.workers)
+                                        ? 1u
+                                        : 0u;
+                }
+                DispatchHandoff handoff;
+                handoff.publish(runtime.acc, runtime.warp, local);
+                handoff.sync(runtime.acc);
+                ImportDispatch const state = handoff.get(runtime.acc);
+                if(state.stagingCount != 0u)
+                    return;
+                if(state.hasRoom == 0u)
+                {
+                    if(runtime.warp.isLeader())
+                        (void) addDevice(runtime.acc, &runtime.state.debugImportBlocked, std::uint64_t{1u});
+                    return;
+                }
+            }
 
-            bool hasRoom = false;
-            if(runtime.warp.isLeader())
-                hasRoom = runtime.ring.inFlightCount() < runtime.args.readySoftLimit
-                          && runtime.pool.freeCount() > runtime.args.workers;
-            hasRoom = broadcastU32(runtime, hasRoom ? 1u : 0u) != 0u;
-            if(!hasRoom)
-                return;
-
-            // One importer lane polls; the resolver maps ids to device pointers.
+            // One importer lane polls; the resolver maps ids to device
+            // pointers. Every exit decision is published and taken uniformly.
+            ImportPoll poll{};
             if(runtime.warp.isLeader())
             {
                 IngressRing<JobDescriptor, poolIngressCapacity>::View view{};
@@ -573,46 +633,64 @@ namespace graph
                     runtime.args.stagingCapacity,
                     runtime.args.maxImportBatch,
                     resolver);
-                if(batch.status == ImportStatus::error)
+                poll.status = batch.status;
+                poll.imported = batch.imported;
+                if(batch.status != ImportStatus::error && batch.imported != 0u)
+                {
+                    std::uint32_t jobs = 0u;
+                    for(std::uint32_t index = 0u; index < batch.imported; ++index)
+                    {
+                        JobDescriptor const& descriptor = runtime.args.staging[index];
+                        if(descriptor.kind == JobKind::END_OF_INPUT)
+                            continue;
+                        ++jobs;
+                        bool const overflow
+                            = descriptor.request.count > ~std::uint64_t{0u} - descriptor.request.firstId;
+                        if(overflow)
+                            recordError(runtime, PoolError::requestOverflow);
+                        if(runtime.args.idLimit != 0u && !overflow
+                           && descriptor.request.firstId + descriptor.request.count
+                                  > static_cast<std::uint64_t>(runtime.args.idLimit))
+                            recordError(runtime, PoolError::idOutOfRange);
+                    }
+                    if(loadDeviceRelaxed(runtime.acc, &runtime.state.errorWord) != 0u)
+                    {
+                        poll.status = ImportStatus::error;
+                    }
+                    else
+                    {
+                        runtime.state.stagingHead = 0u;
+                        runtime.state.stagingCount = jobs;
+                        (void) addDevice(runtime.acc, &runtime.state.importedJobs, static_cast<std::uint64_t>(jobs));
+                        (void) addDevice(runtime.acc, &runtime.state.pendingSources, static_cast<std::uint64_t>(jobs));
+                        (void) addDevice(runtime.acc, &runtime.state.outstanding, static_cast<std::uint64_t>(jobs));
+                        if(batch.endMarkerSeen)
+                            storeDeviceRelease(runtime.acc, &runtime.state.closedSeen, std::uint64_t{1u});
+                        std::uint64_t const imported = loadDeviceRelaxed(runtime.acc, &runtime.state.importedJobs);
+                        graph::systemStoreRelease(runtime.acc, &runtime.host.imported, imported);
+                    }
+                }
+            }
+            PollHandoff handoff;
+            handoff.publish(runtime.acc, runtime.warp, poll);
+            handoff.sync(runtime.acc);
+            ImportPoll const result = handoff.get(runtime.acc);
+            if(result.imported == 0u)
+            {
+                if(runtime.warp.isLeader())
+                    (void) addDevice(runtime.acc, &runtime.state.debugImportEmpty, std::uint64_t{1u});
+            }
+            if(result.status == ImportStatus::error)
+            {
+                if(runtime.warp.isLeader())
                 {
                     recordError(runtime, PoolError::unknownOperation);
                     requestStop(runtime, poolStoppingAborted);
-                    return;
                 }
-                if(batch.imported == 0u)
-                    return;
-
-                std::uint32_t jobs = 0u;
-                for(std::uint32_t index = 0u; index < batch.imported; ++index)
-                {
-                    JobDescriptor const& descriptor = runtime.args.staging[index];
-                    if(descriptor.kind == JobKind::END_OF_INPUT)
-                        continue;
-                    ++jobs;
-                    bool const overflow = descriptor.request.count > ~std::uint64_t{0u} - descriptor.request.firstId;
-                    if(overflow)
-                        recordError(runtime, PoolError::requestOverflow);
-                    if(runtime.args.idLimit != 0u && !overflow
-                       && descriptor.request.firstId + descriptor.request.count
-                              > static_cast<std::uint64_t>(runtime.args.idLimit))
-                        recordError(runtime, PoolError::idOutOfRange);
-                }
-                if(loadDeviceRelaxed(runtime.acc, &runtime.state.errorWord) != 0u)
-                {
-                    requestStop(runtime, poolStoppingAborted);
-                    return;
-                }
-                runtime.state.stagingHead = 0u;
-                runtime.state.stagingCount = jobs;
-                (void) addDevice(runtime.acc, &runtime.state.importedJobs, static_cast<std::uint64_t>(jobs));
-                (void) addDevice(runtime.acc, &runtime.state.pendingSources, static_cast<std::uint64_t>(jobs));
-                (void) addDevice(runtime.acc, &runtime.state.outstanding, static_cast<std::uint64_t>(jobs));
-                if(batch.endMarkerSeen)
-                    storeDeviceRelease(runtime.acc, &runtime.state.closedSeen, std::uint64_t{1u});
-                std::uint64_t const imported = loadDeviceRelaxed(runtime.acc, &runtime.state.importedJobs);
-                graph::systemStoreRelease(runtime.acc, &runtime.host.imported, imported);
+                return;
             }
-            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
+            if(result.imported == 0u)
+                return;
         }
 
         /** Publish successors, the source continuation, and retire the input. */
@@ -741,7 +819,7 @@ namespace graph
             PacketAccessor accessor{};
             if(job.packet.index < static_cast<std::uint32_t>(poolPacketSlotCapacity))
             {
-                PacketRecord const& record = runtime.pool.slotRecord(job.packet);
+                PacketRecord const record = runtime.pool.observedRecord(runtime.acc, job.packet);
                 void* data = runtime.pool.slotData(job.packet);
                 if(!isSource)
                     accessor.setInput(job.routing.inputPort, &record, data);

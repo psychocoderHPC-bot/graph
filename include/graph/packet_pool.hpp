@@ -6,10 +6,12 @@
 #include <alpaka/alpaka.hpp>
 
 #include <graph/detail/concepts.hpp>
+#include <graph/detail/device_atomic.hpp>
 #include <graph/detail/packet.hpp>
 #include <graph/detail/views.hpp>
 #include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
+#include <graph/detail/warp_handoff.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -67,7 +69,10 @@
  * `acquire()` and `release()` are warp-uniform: every active lane of the
  * calling warp calls the same method with the same arguments, and only the
  * lane selected by `WarpGroup::isLeader()` performs the atomic work. The
- * result is broadcast through warp shuffles.
+ * result is published through one block-shared slot followed by a block
+ * barrier, never through a warp shuffle: the CAS retry loop is a leader-only
+ * region and the pinned alpaka's shuffle is driven by `__activemask()`, which
+ * does not reconverge the warp. See `graph/detail/warp_handoff.hpp`.
  *
  * # Capacity budget (spec 6)
  *
@@ -306,6 +311,21 @@ namespace graph
         static constexpr std::size_t slotBytes = sizeof(PoolSlot);
         static constexpr std::size_t storageBytes = headerBytes + T_SlotCapacity * slotBytes;
 
+        /** One acquisition result, distributed through block-shared memory.
+         *
+         * The leader writes it once; every lane reads the same bytes after the
+         * handoff barrier. `valid == 0` leaves `handle` unspecified, so a
+         * caller must consult `valid` first.
+         */
+        struct Claim
+        {
+            PacketHandle handle{};
+            std::uint32_t valid{0u};
+        };
+
+        static_assert(std::is_trivially_copyable_v<Claim>);
+        static_assert(std::is_standard_layout_v<Claim>);
+
         /** Construct a view over preallocated device storage of at least
          *  `storageBytes` bytes. The storage must stay valid and exclusively
          *  owned by this pool for its lifetime. */
@@ -337,6 +357,8 @@ namespace graph
                     hdr->freeCount = 0u;
                     hdr->violations = 1u;
                     hdr->headVersion = 0u;
+                    hdr->casFailures = 0u;
+                    hdr->metaChecks = 0u;
                     // Initialize slot metas so a misconfigured pool is still in
                     // a defined (if unusable) state.
                     for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
@@ -351,6 +373,8 @@ namespace graph
                 {
                     hdr->violations = 0u;
                     hdr->headVersion = 0u;
+                    hdr->casFailures = 0u;
+                    hdr->metaChecks = 0u;
                     hdr->freeCount = static_cast<std::uint64_t>(T_SlotCapacity);
                     hdr->freeListHead = 0u; // index 0, tag 0
                     for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
@@ -371,8 +395,10 @@ namespace graph
                     pool_detail::publishRelease(acc);
                 }
             }
-            auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
-            return warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
+            WarpHandoff<Acc, std::uint32_t, handoff_id::packetPoolConfigure> handoff;
+            handoff.publish(acc, warp, static_cast<std::uint32_t>(ok ? 1u : 0u));
+            handoff.sync(acc);
+            return handoff.get(acc) != 0u;
         }
 
         /** Acquire one slot.
@@ -380,22 +406,26 @@ namespace graph
          * Warp-uniform. On success, `out` holds the handle (index plus the
          * slot's new generation) and the slot's `record` is reset so the
          * caller fills in its schema and element count. The leader performs
-         * the atomic work and the result is broadcast.
+         * the atomic work, writes `{handle, valid}` into the block-shared
+         * `Claim`, and every lane reads it after the barrier.
          *
          * Returns `true` on success, `false` when no slot is free.
          */
         ALPAKA_FN_ACC constexpr bool acquire(Acc const& acc, WarpGroup<Acc> const& warp, PacketHandle& out) noexcept
         {
-            bool ok = false;
+            WarpHandoff<Acc, Claim, handoff_id::packetPoolClaim> handoff;
+            Claim claim{};
             if(warp.isLeader())
             {
-                ok = popSlot(acc, out);
+                PacketHandle handle{};
+                claim.valid = popSlot(acc, handle) ? 1u : 0u;
+                claim.handle = handle;
             }
-            auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
-            ok = warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
-            if(ok)
-                broadcastHandle(warp, out);
-            return ok;
+            handoff.publish(acc, warp, claim);
+            handoff.sync(acc);
+            Claim const result = handoff.get(acc);
+            out = result.handle;
+            return result.valid != 0u;
         }
 
         /** Release one slot.
@@ -416,13 +446,13 @@ namespace graph
             WarpGroup<Acc> const& warp,
             PacketHandle const& handle) noexcept
         {
-            bool ok = false;
+            WarpHandoff<Acc, std::uint32_t, handoff_id::packetPoolRelease> handoff;
+            std::uint32_t ok = 0u;
             if(warp.isLeader())
-            {
-                ok = pushSlot(acc, handle);
-            }
-            auto const value = static_cast<std::uint32_t>(ok ? 1u : 0u);
-            return warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
+                ok = pushSlot(acc, handle) ? 1u : 0u;
+            handoff.publish(acc, warp, ok);
+            handoff.sync(acc);
+            return handoff.get(acc) != 0u;
         }
 
         /** True when `handle` names a slot the pool currently considers owned
@@ -430,18 +460,14 @@ namespace graph
          *  generation-mismatch check that makes a use-after-release
          *  detectable in test builds. */
         [[nodiscard]] ALPAKA_FN_ACC constexpr bool isValid(
-            Acc const&,
+            Acc const& acc,
             WarpGroup<Acc> const& warp,
             PacketHandle const& handle) const noexcept
         {
-            bool valid = false;
-            if(warp.isLeader())
-            {
-                auto const& slot = slotAt(handle.index);
-                valid = slot.meta.generation == handle.generation && slot.meta.active == 1u;
-            }
-            auto const value = static_cast<std::uint32_t>(valid ? 1u : 0u);
-            return warp.template broadcast<std::uint32_t>(value, 0u) != 0u;
+            (void) acc;
+            (void) warp;
+            auto const& slot = slotAt(handle.index);
+            return slot.meta.generation == handle.generation && slot.meta.active == 1u;
         }
 
         /** Raw element pointer for a slot. The caller must hold the slot
@@ -455,6 +481,38 @@ namespace graph
         [[nodiscard]] ALPAKA_FN_ACC constexpr PacketRecord const& slotRecord(PacketHandle const& handle) const noexcept
         {
             return slotAt(handle.index).record;
+        }
+
+        /** Coherent read of the generation the pool currently holds for a slot.
+         *
+         * The record is written by the warp that won the slot in *another*
+         * block, and the reading block may already hold a stale line: every
+         * loser of the free-list CAS reads the popped slot's record while
+         * walking the list. The read must therefore be the synchronizing
+         * acquire load that matches the writer's release, not a weak load.
+         */
+        [[nodiscard]] ALPAKA_FN_ACC std::uint32_t observedGeneration(Acc const& acc, SlotIndex index) const noexcept
+        {
+            (void) acc;
+            return detail::dev::loadAcquire(&slotAt(index).record.handle.generation);
+        }
+
+        /** Coherent snapshot of a slot's record.
+         *
+         * Same reason as `observedGeneration`. The word-wise acquire copy is
+         * once per job and is the only way to read `schema`, `capacity`, and
+         * `elementCount` that another block published.
+         */
+        [[nodiscard]] ALPAKA_FN_ACC PacketRecord observedRecord(Acc const& acc, PacketHandle const& handle)
+            const noexcept
+        {
+            static_assert(sizeof(PacketRecord) % sizeof(std::uint32_t) == 0u);
+            PacketRecord result{};
+            auto const* source = reinterpret_cast<std::uint32_t const*>(&slotAt(handle.index).record);
+            auto* destination = reinterpret_cast<std::uint32_t*>(&result);
+            for(std::size_t word = 0u; word < sizeof(PacketRecord) / sizeof(std::uint32_t); ++word)
+                destination[word] = detail::dev::loadAcquire(&source[word]);
+            return result;
         }
 
         /** Set the logical element count of a slot's record. The caller must
@@ -580,7 +638,7 @@ namespace graph
                 // stable while this slot is at the head (only a push of this
                 // slot can change it, and a push requires a release, which
                 // requires the slot to be held, which requires it off the list).
-                std::uint32_t const next = slot->record.handle.index;
+                std::uint32_t const next = detail::dev::loadAcquire(&slot->record.handle.index);
                 // Build the desired head: the successor's index with the
                 // terminator tag. The tag is what closes the ABA window: a
                 // stale CAS against a head that has cycled through the same
@@ -685,21 +743,6 @@ namespace graph
         [[nodiscard]] ALPAKA_FN_ACC constexpr PoolSlot& slotAt(std::size_t index) const noexcept
         {
             return *reinterpret_cast<PoolSlot*>(m_storage + headerBytes + index * slotBytes);
-        }
-
-        /** Broadcast the handle from the leader to all lanes. */
-        ALPAKA_FN_ACC constexpr void broadcastHandle(WarpGroup<Acc> const& warp, PacketHandle& handle) const noexcept
-        {
-            if constexpr(Acc::getWarpSize() == 1u)
-            {
-                (void) warp;
-                (void) handle;
-            }
-            else
-            {
-                handle.index = warp.template broadcast<std::uint32_t>(handle.index, 0u);
-                handle.generation = warp.template broadcast<std::uint32_t>(handle.generation, 0u);
-            }
         }
 
         char* m_storage;

@@ -264,13 +264,15 @@ namespace
             // against the first acquire in other blocks. The ready flag is
             // stored in the results array (results[10]).
             auto* readyFlag = reinterpret_cast<std::uint64_t*>(results + 10);
-            if(blockIndex == 0u && warp.isLeader())
+            if(blockIndex == 0u)
             {
                 auto budget = graph::PacketPoolBudget{};
                 budget.liveParticles = static_cast<std::uint32_t>(T_SlotCapacity);
+                // `configure()` is warp-uniform, like `acquire()`/`release()`.
                 (void) pool.configure(acc, warp, budget);
                 alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
-                *readyFlag = 1ull;
+                if(warp.isLeader())
+                    *readyFlag = 1ull;
             }
             // All warps wait for the ready flag (device-scope acquire).
             {
@@ -283,27 +285,30 @@ namespace
             alpaka::onAcc::memFence(acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::acquire);
 
             std::uint64_t acqOk = 0u, acqFail = 0u, relFail = 0u, doubleOut = 0u, nonMono = 0u;
-            if(warp.isLeader())
+            // `acquire()` and `release()` are warp-uniform: the leader does the
+            // atomic work and publishes the result to every lane through a
+            // block-shared handoff, so all lanes must call them. The per-item
+            // accounting and the marker protocol stay leader-only.
+            //
+            // A monotonically increasing nonce distinguishes the current holder
+            // from the previous one: a marker with a different nonce means a
+            // double hand-out.
+            std::uint64_t nonce = 0u;
+            for(std::uint32_t i = 0u; i < acquiresPerWarp; ++i)
             {
-                // The CPU serial executor runs one width-one warp per launch, so
-                // it does one warp's share; the GPU runs every block's warp and
-                // the expected total scales with the block count.
-                // A monotonically increasing nonce distinguishes the current
-                // holder from the previous one: a marker with a different
-                // nonce means a double hand-out.
-                std::uint64_t nonce = 0u;
-                for(std::uint32_t i = 0u; i < acquiresPerWarp; ++i)
+                graph::PacketHandle h{};
+                bool const got = pool.acquire(acc, warp, h);
+                if(!got)
                 {
-                    graph::PacketHandle h{};
-                    bool const got = pool.acquire(acc, warp, h);
-                    if(!got)
-                    {
-                        // The other warps release as fast as they acquire, so
-                        // the free list cannot be empty for long; a failure is
-                        // a lost slot, not exhaustion.
+                    // The other warps release as fast as they acquire, so the
+                    // free list cannot be empty for long; a failure is a lost
+                    // slot, not exhaustion.
+                    if(warp.isLeader())
                         acqFail++;
-                        continue;
-                    }
+                    continue;
+                }
+                if(warp.isLeader())
+                {
                     acqOk++;
                     nonce++;
                     // Write our marker atomically. While this warp owns the
@@ -312,11 +317,7 @@ namespace
                     // releasing, and no other warp can be writing to
                     // `out[h.index]` while we hold the slot.
                     auto const marker = static_cast<std::uint64_t>(blockIndex + 1u) << 32u | nonce;
-                    alpaka::onAcc::atomicExch(
-                        acc,
-                        &out[h.index],
-                        marker,
-                        alpaka::onAcc::scope::device);
+                    alpaka::onAcc::atomicExch(acc, &out[h.index], marker, alpaka::onAcc::scope::device);
                     // Read the marker back BEFORE the release. While we own
                     // the slot, the marker is exactly what we just wrote.
                     // If it differs, another warp wrote to it concurrently,
@@ -325,7 +326,7 @@ namespace
                     auto const readback = alpaka::onAcc::atomicExch(
                         acc,
                         &out[h.index],
-                        marker,  // write back the same value (no-op)
+                        marker, // write back the same value (no-op)
                         alpaka::onAcc::scope::device);
                     if(readback != marker)
                     {
@@ -333,7 +334,10 @@ namespace
                         if((readback & 0xffff'ffffull) > nonce)
                             nonMono++;
                     }
-                    bool const freed = pool.release(acc, warp, h);
+                }
+                bool const freed = pool.release(acc, warp, h);
+                if(warp.isLeader())
+                {
                     if(!freed)
                         relFail++;
                     // Clear the marker atomically AFTER the release: once
@@ -479,19 +483,34 @@ namespace
      * free-list hand-out: no slot is handed to two warps at once, no slot is
      * lost, generations are monotonic, and the pool ends clean.
      */
-    template<std::size_t T_SlotCapacity, std::size_t T_ElementCapacity, std::uint32_t T_BlockCount, std::uint32_t T_AcquiresPerWarp>
+    template<
+        std::size_t T_SlotCapacity,
+        std::size_t T_ElementCapacity,
+        std::uint32_t T_BlockCount,
+        std::uint32_t T_AcquiresPerWarp>
     void runContention()
     {
         auto device = makeTestDevice();
         using Pool = graph::PacketPool<int, T_SlotCapacity, T_ElementCapacity>;
-        auto const totalBytes = Pool::storageBytes + 12 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
+        auto const totalBytes
+            = Pool::storageBytes + 12 * sizeof(std::uint64_t) + T_SlotCapacity * sizeof(std::uint64_t);
 
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
         auto deviceBuffer = alpaka::onHost::allocLike(device, hostBuffer);
-
-        launchWarps(device, T_BlockCount, PoolContentionKernel<T_SlotCapacity, T_ElementCapacity>{}, deviceBuffer, T_AcquiresPerWarp);
+        // allocLike() does not copy the host contents, and the contention
+        // kernel accumulates into a zero-filled results array, so the zero fill
+        // must be copied to the device explicitly.
         auto queue = device.makeQueue();
+        alpaka::onHost::memcpy(queue, deviceBuffer, hostBuffer);
+        alpaka::onHost::wait(queue);
+
+        launchWarps(
+            device,
+            T_BlockCount,
+            PoolContentionKernel<T_SlotCapacity, T_ElementCapacity>{},
+            deviceBuffer,
+            T_AcquiresPerWarp);
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 
@@ -509,8 +528,8 @@ namespace
             "cap=" << T_SlotCapacity << " warps=" << T_BlockCount << " acqPerWarp=" << T_AcquiresPerWarp
                    << " acqOk=" << results[0] << " acqFail=" << results[1] << " relFail=" << results[2]
                    << " doubleOut=" << results[3] << " nonMono=" << results[4] << " violations=" << results[5]
-                   << " freeCount=" << results[6] << " heldAtEnd=" << results[7]
-                   << " casFailures=" << results[8] << " metaChecks=" << results[9]);
+                   << " freeCount=" << results[6] << " heldAtEnd=" << results[7] << " casFailures=" << results[8]
+                   << " metaChecks=" << results[9]);
         // Every warp did its full iteration count: successes + failures = total.
         CHECK(results[0] + results[1] == expectedAcq);
         // No release should fail: a release fails only when the handle is
@@ -538,9 +557,12 @@ namespace
         auto hostBuffer = alpaka::onHost::allocHost<std::uint8_t>(totalBytes);
         std::memset(hostBuffer.data(), 0, totalBytes);
         auto deviceBuffer = alpaka::onHost::allocLike(device, hostBuffer);
+        auto queue = device.makeQueue();
+        // allocLike() does not copy; the kernel expects the zero fill.
+        alpaka::onHost::memcpy(queue, deviceBuffer, hostBuffer);
+        alpaka::onHost::wait(queue);
 
         launchOneWarp(device, PoolUnderBudgetKernel<T_SlotCapacity, T_ElementCapacity>{}, deviceBuffer);
-        auto queue = device.makeQueue();
         alpaka::onHost::memcpy(queue, hostBuffer, deviceBuffer);
         alpaka::onHost::wait(queue);
 

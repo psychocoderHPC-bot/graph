@@ -56,7 +56,7 @@ and the scheduler (`include/graph/detail/scheduler.hpp`) are implemented on the
 
 ```
 host producer -> ingress ring (mapped pinned, release store)
-   -> ready ring (device acquire, warp leader dequeue, WarpBarrier, shuffle broadcast)
+   -> ready ring (device acquire, warp leader dequeue, block-shared ClaimResult)
    -> OperationFn<Acc>(acc, job, accessor)  [all lanes]
    -> chunk assembly (StreamReservation: reserve, write, commit)
    -> sink; input packet retired exactly once after the commit
@@ -73,13 +73,25 @@ host producer -> ingress ring (mapped pinned, release store)
    `WarpBarrier::barrier()`, and the leader's `enqueue()` publishes the slot
    with a device-scope release fence before the counter advance. The consumer
    leader acquires under the lock, copies the entry out, and advances the
-   claim counter; the caller runs `WarpBarrier::barrier()` before any lane
-   reads the broadcast entry. A warp vote orders nothing: it observes
-   predicates, it does not order one lane's stores against another lane's
-   reads. The probe `probes/warp_barrier_probe.cu` contrasts vote and barrier;
-   values in [`known-limitations.md`](known-limitations.md).
-3. Leader to lanes: the claimed `JobDescriptor` is broadcast field by field by
-   warp shuffle, so every lane holds an identical copy.
+   claim counter. It writes the whole `ClaimResult` (descriptor, ring slot,
+   claim stamp, operation id, packet handle, status, valid flag) into one
+   block-shared slot. The ring then runs a block barrier and every lane reads
+   the same bytes. A warp vote orders nothing: it observes predicates, it does
+   not order one lane's stores against another lane's reads. The probe
+   `probes/warp_barrier_probe.cu` contrasts vote and barrier; values in
+   [`known-limitations.md`](known-limitations.md).
+3. Leader to lanes: never by shuffle. The pinned alpaka implements `shfl` as
+   `__shfl_sync(__activemask(), ...)`, and `__activemask()` reports the lanes
+   that happen to be converged at the call site; it does not reconverge a warp
+   that a leader-only region split. After `PacketPool::acquire`'s CAS retry
+   loop the leader and the other 31 lanes stay in two convergence groups, so
+   every later shuffle silently returns the caller's own value. Measured on the
+   A30: the mask is `0x1` on lane 0 and `0xfffffffe` on the rest immediately
+   after `acquire`. The pool therefore moves every claim/status value through
+   `WarpHandoff` (`include/graph/detail/warp_handoff.hpp`): the leader writes a
+   block-shared slot, all lanes run `syncBlockThreads`, then read. Shuffles
+   remain available for code that never crosses a leader-only region, but no
+   pool decision depends on one.
 4. Functors: all lanes enter the same `OperationFn` call. Functors use only
    warp-local synchronization; no block-wide or grid-wide barriers, no
    allocation, no exceptions.

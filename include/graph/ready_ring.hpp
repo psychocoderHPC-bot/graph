@@ -8,6 +8,7 @@
 #include <graph/detail/job.hpp>
 #include <graph/detail/warp_barrier.hpp>
 #include <graph/detail/warp_group.hpp>
+#include <graph/detail/warp_handoff.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -46,11 +47,18 @@
  * # Copy out before reclaim
  *
  * On a claim the leader reads the whole entry into a local copy *before* the
- * slot is marked reclaimable (the `claimCounter` advance). The entry is then
- * broadcast field by field through warp shuffles. The slot is writable again
- * only once `claimCounter` has advanced, and the next producer writes the new
- * entry under the lock, so the consumer's local copy is independent of the
- * slot being reused underneath it.
+ * slot is marked reclaimable (the `claimCounter` advance). The result of the
+ * claim is then written into one block-shared `ClaimResult` slot and the warp
+ * runs a block barrier; every lane reads the result from shared memory. The
+ * slot is writable again only once `claimCounter` has advanced, and the next
+ * producer writes the new entry under the lock, so the consumer's local copy is
+ * independent of the slot being reused underneath it.
+ *
+ * The claim result is **not** distributed through warp shuffles. The pinned
+ * alpaka implements a shuffle with `__activemask()`, which does not reconverge
+ * the warp, so a shuffle after a leader-only region can silently deliver the
+ * caller's own value. See `graph/detail/warp_handoff.hpp` for the contract and
+ * the measurement.
  *
  * # The lock
  *
@@ -74,11 +82,15 @@
  * Producer: the lanes finish writing their contribution to the caller-owned
  * entry, the caller runs `WarpBarrier::barrier`, then the leader's `enqueue`
  * publishes the slot with a device-scope release before it retakes the lock.
+ * The returned status is written to a block-shared word and read by every lane
+ * after the ring's own block barrier, so control flow downstream of an
+ * `enqueue` is genuinely warp-uniform.
  *
  * Consumer: the leader's `dequeue` acquires under the lock, copies the entry
- * out, advances `claimCounter`, and unlocks. The caller then runs
- * `WarpBarrier::barrier` so the leader's release is ordered before any lane
- * reads the broadcast entry.
+ * into the block-shared `ClaimResult`, advances `claimCounter`, and unlocks;
+ * the ring then runs the block barrier and every lane reads the claim result
+ * from shared memory.
+ *
  *
  * # Layout
  *
@@ -104,6 +116,37 @@ namespace graph
 
     /** One ready entry: the full job descriptor, copied bitwise into the ring. */
     using ReadyEntry = JobDescriptor;
+
+    /** The complete outcome of one claim, distributed through block-shared
+     *  memory.
+     *
+     * The leader fills this once per `dequeue` and never mutates it afterwards.
+     * Every lane reads the same bytes after the ring's block barrier, so the
+     * descriptor, the packet handle, and the status are identical on all lanes
+     * by construction instead of by a shuffle. `valid` is the single predicate
+     * every downstream branch may use; `entry` is the immutable descriptor the
+     * claim read out of the ring slot.
+     */
+    struct ClaimResult
+    {
+        /** The claimed descriptor (undefined unless `valid` is one). */
+        ReadyEntry entry{};
+        /** Ring slot the claim read (`claimCounter & slotMask`). */
+        std::uint64_t slotIndex{0u};
+        /** Monotonic claim stamp, the value the slot was validated against. */
+        std::uint64_t generation{0u};
+        /** Operation id of the claimed descriptor. */
+        OperationId operationId{};
+        /** Packet the claimed descriptor names. */
+        PacketHandle packet{};
+        /** Outcome of the claim attempt. */
+        RingStatus status{RingStatus::Empty};
+        /** One when `entry` is a real claim, zero otherwise. */
+        std::uint32_t valid{0u};
+    };
+
+    static_assert(std::is_trivially_copyable_v<ClaimResult>);
+    static_assert(std::is_standard_layout_v<ClaimResult>);
 
     namespace ring_detail
     {
@@ -151,9 +194,11 @@ namespace graph
      * public methods are device-side (`ALPAKA_FN_ACC`) and warp-uniform: every
      * active lane of the calling warp must call the same method with the same
      * arguments, and only the lane selected by `WarpGroup::isLeader()` performs
-     * the locked work. The methods do **not** run a barrier themselves; the
-     * caller runs `WarpBarrier::barrier` around them so the leader's
-     * publication/acquisition is ordered against the lanes.
+     * the locked work. `enqueue` and `dequeue` run a block barrier themselves
+     * (inside the block-shared handoff) so the leader's result is visible to
+     * every lane before they return; the caller's own producer barrier before
+     * an `enqueue` is still required. The ring is used one warp per block, so
+     * that barrier is a warp barrier.
      */
     template<typename T_Acc, std::size_t T_Capacity = 1024u>
     class ReadyRing
@@ -235,10 +280,12 @@ namespace graph
         /** Nonblocking attempt to publish one entry.
          *
          * Warp-uniform: every active lane calls it with the same `entry`. The
-         * leader performs the locked work and the result is broadcast. The
-         * caller is responsible for the producer barrier *before* this call
-         * (so the lanes' stores into `entry` are complete) and for any
-         * consumer-side ordering the protocol needs. The ring does not block.
+         * leader performs the locked work; the status is written to a
+         * block-shared word, the ring runs a block barrier, and every lane
+         * reads the same status. The caller is responsible for the producer
+         * barrier *before* this call (so the lanes' stores into `entry` are
+         * complete) and for any consumer-side ordering the protocol needs. The
+         * ring does not block.
          *
          * On `Full` the ring is at capacity; the caller backs off and retries.
          * On `Contended` another warp holds the lock; the caller backs off.
@@ -248,53 +295,22 @@ namespace graph
             WarpGroup<Acc> const& warp,
             ReadyEntry const& entry) noexcept
         {
-            RingStatus status = RingStatus::Contended;
+            WarpHandoff<Acc, std::uint32_t, handoff_id::readyRingPush> handoff;
+            std::uint32_t status = static_cast<std::uint32_t>(RingStatus::Contended);
             if(warp.isLeader())
-            {
-                if(!tryLock(acc))
-                {
-                    status = RingStatus::Contended;
-                }
-                else
-                {
-                    auto* hdr = &header();
-                    auto const inFlight = hdr->pushCounter - hdr->claimCounter; // delta; wraps safely
-                    if(inFlight >= capacityStamp)
-                    {
-                        unlock(acc);
-                        status = RingStatus::Full;
-                    }
-                    else
-                    {
-                        // Reserve and publish under the lock. The slot is the
-                        // push counter's position; it is free because inFlight
-                        // < capacity.
-                        auto const stamp = hdr->pushCounter;
-                        auto* slot = &slotAt(stamp & slotMask);
-                        // Device-scope release: the payload stores the lanes
-                        // made before the caller's producer barrier are ordered
-                        // before the lock release / counter advance that the
-                        // consumer will acquire against.
-                        slot->entry = entry;
-                        slot->sequence = stamp;
-                        ring_detail::publishRelease(acc);
-                        hdr->pushCounter = stamp + 1u;
-                        unlock(acc);
-                        status = RingStatus::Accepted;
-                    }
-                }
-            }
-            return broadcastStatus(acc, warp, status);
+                status = static_cast<std::uint32_t>(pushOnce(acc, entry));
+            handoff.publish(acc, warp, status);
+            handoff.sync(acc);
+            return static_cast<RingStatus>(handoff.get(acc));
         }
 
         /** Nonblocking attempt to claim the next entry.
          *
-         * Warp-uniform. On `Accepted`, `out` holds the claimed entry (copied
-         * out of the slot before the slot is reclaimable) and the entry is
-         * broadcast field by field so every lane holds an identical copy. The
-         * caller runs `WarpBarrier::barrier` *after* this call before any lane
-         * reads the payload, ordering the leader's acquisition against the
-         * lanes. The ring does not block.
+         * Warp-uniform. The leader claims under the lock and writes the whole
+         * `ClaimResult` into one block-shared slot; the ring then runs a block
+         * barrier and every lane reads the claim result from that slot. On
+         * `Accepted`, `out` holds the claimed entry on every lane and the
+         * status is identical everywhere. The ring does not block.
          *
          * On `Empty` the ring has no in-flight entry. On `Contended` another
          * warp holds the lock.
@@ -304,55 +320,16 @@ namespace graph
             WarpGroup<Acc> const& warp,
             ReadyEntry& out) noexcept
         {
-            RingStatus status = RingStatus::Contended;
+            WarpHandoff<Acc, ClaimResult, handoff_id::readyRingClaim> handoff;
+            ClaimResult claim{};
             if(warp.isLeader())
-            {
-                if(!tryLock(acc))
-                {
-                    status = RingStatus::Contended;
-                }
-                else
-                {
-                    auto* hdr = &header();
-                    auto const inFlight = hdr->pushCounter - hdr->claimCounter; // delta; wraps safely
-                    if(inFlight == 0u)
-                    {
-                        unlock(acc);
-                        status = RingStatus::Empty;
-                    }
-                    else
-                    {
-                        // The oldest in-flight entry carries `sequence ==
-                        // claimCounter`. Device-scope acquire: ordered against
-                        // the producer's release so the entry payload is
-                        // visible.
-                        auto const stamp = hdr->claimCounter;
-                        auto* slot = &slotAt(stamp & slotMask);
-                        ring_detail::claimAcquire(acc);
-
-                        // Ownership-violation hook (test builds): a valid
-                        // claim finds the slot stamped exactly with `stamp`.
-                        // Anything else means a consumer lagged a full lap and
-                        // the slot was reused underneath it.
-                        if(slot->sequence != stamp)
-                        {
-                            ring_detail::atomicFetchAddDevice(acc, &hdr->violations, std::uint64_t{1u});
-                        }
-
-                        // Copy the entry out BEFORE reclaiming the slot. The
-                        // slot is reclaimable only after claimCounter advances.
-                        out = slot->entry;
-                        ring_detail::publishRelease(acc);
-                        hdr->claimCounter = stamp + 1u;
-                        unlock(acc);
-                        status = RingStatus::Accepted;
-                    }
-                }
-            }
-            status = broadcastStatus(acc, warp, status);
-            if(status == RingStatus::Accepted)
-                broadcastEntry(warp, out);
-            return status;
+                claim = claimOnce(acc);
+            handoff.publish(acc, warp, claim);
+            handoff.sync(acc);
+            ClaimResult const result = handoff.get(acc);
+            if(result.valid != 0u)
+                out = result.entry;
+            return result.status;
         }
 
         /** Number of in-flight entries (push minus claim, as a delta). */
@@ -403,47 +380,81 @@ namespace graph
             return *reinterpret_cast<RingSlot*>(m_storage + headerBytes + index * slotBytes);
         }
 
-        ALPAKA_FN_ACC constexpr RingStatus broadcastStatus(
-            Acc const& acc,
-            WarpGroup<Acc> const& warp,
-            RingStatus status) const noexcept
+        /** Publish one entry under the lock. Leader only.
+         *
+         * Kept separate from `enqueue` so the collective wrapper has exactly
+         * one leader-only region and one handoff.
+         */
+        ALPAKA_FN_ACC constexpr RingStatus pushOnce(Acc const& acc, ReadyEntry const& entry) const noexcept
         {
-            auto const value = static_cast<std::uint32_t>(status);
-            auto const b = warp.template broadcast<std::uint32_t>(value, 0u);
-            (void) acc;
-            return static_cast<RingStatus>(b);
+            if(!tryLock(acc))
+                return RingStatus::Contended;
+            auto* hdr = &header();
+            auto const inFlight = hdr->pushCounter - hdr->claimCounter; // delta; wraps safely
+            if(inFlight >= capacityStamp)
+            {
+                unlock(acc);
+                return RingStatus::Full;
+            }
+            // Reserve and publish under the lock. The slot is the push
+            // counter's position; it is free because inFlight < capacity.
+            auto const stamp = hdr->pushCounter;
+            auto* slot = &slotAt(stamp & slotMask);
+            // Device-scope release: the payload stores the lanes made before
+            // the caller's producer barrier are ordered before the lock release
+            // / counter advance that the consumer will acquire against.
+            slot->entry = entry;
+            slot->sequence = stamp;
+            ring_detail::publishRelease(acc);
+            hdr->pushCounter = stamp + 1u;
+            unlock(acc);
+            return RingStatus::Accepted;
         }
 
-        /** Broadcast every field of the entry from the leader to all lanes.
+        /** Claim the oldest entry under the lock. Leader only.
          *
-         * The entry is a trivially copyable POD; it is exchanged field by field
-         * through warp broadcasts (shuffle on the device, identity on the
-         * width-one host fallback) so every lane ends with an identical copy
-         * without the leader writing to lane-private memory.
+         * Copies the entry into the returned `ClaimResult` *before* advancing
+         * `claimCounter`, so the result never observes a slot the producer has
+         * already reused.
          */
-        ALPAKA_FN_ACC constexpr void broadcastEntry(WarpGroup<Acc> const& warp, ReadyEntry& entry) const noexcept
+        ALPAKA_FN_ACC constexpr ClaimResult claimOnce(Acc const& acc) const noexcept
         {
-            if constexpr(Acc::getWarpSize() == 1u)
+            ClaimResult result{};
+            result.status = RingStatus::Contended;
+            if(!tryLock(acc))
+                return result;
+            auto* hdr = &header();
+            auto const inFlight = hdr->pushCounter - hdr->claimCounter; // delta; wraps safely
+            if(inFlight == 0u)
             {
-                (void) warp;
-                (void) entry;
+                unlock(acc);
+                result.status = RingStatus::Empty;
+                return result;
             }
-            else
-            {
-                entry.operation.value = warp.template broadcast<std::uint32_t>(entry.operation.value, 0u);
-                entry.kind = static_cast<JobKind>(
-                    warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(entry.kind), 0u));
-                entry.packet.index = warp.template broadcast<std::uint32_t>(entry.packet.index, 0u);
-                entry.packet.generation = warp.template broadcast<std::uint32_t>(entry.packet.generation, 0u);
-                entry.routing.inputPort = warp.template broadcast<std::uint32_t>(entry.routing.inputPort, 0u);
-                entry.routing.outputPort = warp.template broadcast<std::uint32_t>(entry.routing.outputPort, 0u);
-                entry.routing.outputPortCount
-                    = warp.template broadcast<std::uint32_t>(entry.routing.outputPortCount, 0u);
-                entry.request.firstId = warp.template broadcast<std::uint64_t>(entry.request.firstId, 0u);
-                entry.request.count = warp.template broadcast<std::uint64_t>(entry.request.count, 0u);
-                entry.request.seed = warp.template broadcast<std::uint64_t>(entry.request.seed, 0u);
-                entry.sequenceNumber = warp.template broadcast<std::uint64_t>(entry.sequenceNumber, 0u);
-            }
+            // The oldest in-flight entry carries `sequence == claimCounter`.
+            // Device-scope acquire: ordered against the producer's release so
+            // the entry payload is visible.
+            auto const stamp = hdr->claimCounter;
+            auto* slot = &slotAt(stamp & slotMask);
+            ring_detail::claimAcquire(acc);
+            // Ownership-violation hook (test builds): a valid claim finds the
+            // slot stamped exactly with `stamp`. Anything else means a consumer
+            // lagged a full lap and the slot was reused underneath it.
+            if(slot->sequence != stamp)
+                (void) ring_detail::atomicFetchAddDevice(acc, &hdr->violations, std::uint64_t{1u});
+            // Copy the entry out BEFORE reclaiming the slot. The slot is
+            // reclaimable only after claimCounter advances.
+            result.entry = slot->entry;
+            result.slotIndex = stamp & slotMask;
+            result.generation = stamp;
+            result.operationId = result.entry.operation;
+            result.packet = result.entry.packet;
+            result.valid = 1u;
+            result.status = RingStatus::Accepted;
+            ring_detail::publishRelease(acc);
+            hdr->claimCounter = stamp + 1u;
+            unlock(acc);
+            return result;
         }
 
         char* m_storage;
