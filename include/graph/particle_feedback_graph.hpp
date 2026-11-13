@@ -6,6 +6,7 @@
 #include <alpaka/alpaka.hpp>
 
 #include <graph/graph_model.hpp>
+#include <graph/particle_functors.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -38,23 +39,17 @@ namespace graph
     {
         /** Element carried by every stream of the example.
          *
-         * This is a layout carrier only. The algorithms defined elsewhere give
-         * the fields their meaning: `id` is the unique source id, `rngState` is
-         * the reproducible random-stream position, `property` is the original
-         * fixed-point property, `weight` is the accumulated integer weight, and
-         * `visits` counts feedback rounds. Values are integers so an exact 0.5
-         * comparison and CPU/GPU equality are possible.
+         * The one `graph::Particle` type of `particle_functors.hpp` is reused
+         * here so the schema a stream is declared with and the element the
+         * functor reads and writes are the same type. The 24-byte layout
+         * (`id`, `property`, `weight`, `visit`) is kept: the deterministic RNG
+         * is a pure function of `(seed, id, visit, purpose)`, so no per-particle
+         * random state is needed and no second, differently sized layout can
+         * drift from the functor.
          */
-        struct Particle
-        {
-            std::uint64_t id{0u};
-            std::uint64_t rngState{0u};
-            std::uint32_t property{0u};
-            std::uint32_t weight{0u};
-            std::uint32_t visits{0u};
-            std::uint32_t reserved{0u};
-        };
+        using Particle = graph::Particle;
 
+        static_assert(sizeof(Particle) == 24u);
         static_assert(PacketElement<Particle>);
         static_assert(std::is_standard_layout_v<Particle>);
 

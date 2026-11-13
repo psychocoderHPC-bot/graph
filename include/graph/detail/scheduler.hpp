@@ -145,6 +145,65 @@ namespace graph
             std::uint32_t blockThreads;
         };
 
+        /** Byte-level assembly view used by the scheduler.
+         *
+         * The scheduler does not know the functor element type. It copies
+         * `count * elementSize` bytes from an output span into the destination
+         * stream's reserved logical range and converts back to element counts
+         * at publication. Chunk capacities in the assembler are therefore byte
+         * capacities (`Y * elementSize`).
+         */
+        using AssemblyElement = std::uint8_t;
+        using AssemblyStreamState = AssemblyStream<AssemblyElement>;
+        using AssemblySlot = ChunkSlot<AssemblyElement>;
+        using AssemblyReservation = StreamReservation<AssemblyElement>;
+        using Assembly = StreamAssembler<AssemblyElement>;
+
+        /** Build the assembler over the preallocated stream table and the
+         *  packet pool's payload area.
+         *
+         * The arena overlays the packet pool: slot `i` of the arena is slot
+         * `i` of the pool, so a chunk slot's handle travels downstream with
+         * the published packet. The stride between slots is the pool's slot
+         * stride, while the logical capacity is one chunk.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline Assembly makeAssembly(SchedulerRuntime<T_Acc> const& runtime) noexcept
+        {
+            using Pool = typename SchedulerRuntime<T_Acc>::Pool;
+            ChunkArena<AssemblyElement> arena{};
+            if(runtime.args.packetStorage != nullptr && runtime.args.chunkCapacity != 0u)
+            {
+                arena.storage = static_cast<AssemblyElement*>(runtime.args.packetStorage) + Pool::headerBytes;
+                arena.slotCount = runtime.args.assemblySlotCount;
+                arena.elementCapacity = runtime.args.chunkCapacity * runtime.args.packetSchema.elementSize;
+                arena.elementStride = static_cast<std::uint32_t>(Pool::slotBytes);
+            }
+            return Assembly(
+                static_cast<AssemblyStreamState*>(runtime.args.assemblyStorage),
+                runtime.args.assemblyStreamCount,
+                arena);
+        }
+
+        /** Physical chunk descriptor of a packet-pool slot in the arena. */
+        ALPAKA_FN_ACC inline AssemblySlot makeAssemblySlot(
+            PacketHandle const& handle,
+            std::uint32_t capacityBytes) noexcept
+        {
+            return AssemblySlot{handle.index, capacityBytes, 0u, handle};
+        }
+
+        /** Find the compiled stream entry for a stream id. */
+        ALPAKA_FN_ACC inline CompiledStream const* findCompiledStream(CompiledGraph const& graph, StreamId id) noexcept
+        {
+            for(std::uint32_t index = 0u; index < graph.streamCount; ++index)
+            {
+                if(graph.streams[index].id == id)
+                    return &graph.streams[index];
+            }
+            return nullptr;
+        }
+
         /** Find the compiled node that owns an operation id.
          *
          * The scheduler uses one node per operation id (the node that produced
@@ -198,6 +257,7 @@ namespace graph
         {
             std::uint32_t configured{1u};
             std::uint32_t bound{1u};
+            std::uint32_t assembled{1u};
             std::uint32_t ready{1u};
         };
 
@@ -222,6 +282,24 @@ namespace graph
             record.schema = runtime.args.packetSchema;
             record.capacity = runtime.args.chunkCapacity;
             record.elementCount = elementCount;
+        }
+
+        /** Mark a freshly acquired slot as an empty assembly chunk. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline void configureChunkRecord(
+            SchedulerRuntime<T_Acc>& runtime,
+            PacketHandle const& handle) noexcept
+        {
+            configureRecord(runtime, handle, 0u);
+        }
+
+        /** Mark a freshly acquired slot as a full-capacity output scratch span. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline void configureOutputRecord(
+            SchedulerRuntime<T_Acc>& runtime,
+            PacketHandle const& handle) noexcept
+        {
+            configureRecord(runtime, handle, runtime.args.chunkCapacity);
         }
 
         /** Build the ready entry for a successor job.
@@ -371,37 +449,323 @@ namespace graph
             return poolErrorBits(status == RingStatus::Full ? PoolError::readyRingFull : PoolError::internalState);
         }
 
-        /** Acyclic quiescence check. Every worker may run it; the first
-         *  observer publishes the drained stop flag. */
+        /** Publish one assembled chunk to every consumer of its stream.
+         *
+         * The chunk's packet record must already carry its real element count.
+         * A job is counted as outstanding before it becomes visible, so the
+         * acyclic stop rule can never observe the chunk missing. One job is
+         * published per distinct consumer binding, not per edge: several
+         * producers may feed one input port through the same stream, and the
+         * compiled consumer table has already deduplicated them.
+         */
         template<typename T_Acc>
-        ALPAKA_FN_ACC inline void tryQuiesce(SchedulerRuntime<T_Acc>& runtime) noexcept
+        ALPAKA_FN_ACC inline bool publishChunk(
+            SchedulerRuntime<T_Acc>& runtime,
+            StreamId streamId,
+            PacketHandle const& handle,
+            std::uint32_t elementCount,
+            std::uint64_t seed,
+            std::uint64_t sequenceNumber) noexcept
         {
-            if(!runtime.warp.isLeader())
-                return;
-            std::uint64_t const closed = loadDeviceAcquire(runtime.acc, &runtime.state.closedSeen);
-            if(closed == 0u)
-                return;
-            std::uint64_t const pendingSources = loadDeviceRelaxed(runtime.acc, &runtime.state.pendingSources);
-            if(pendingSources != 0u)
-                return;
-            std::uint64_t const outstanding = loadDeviceRelaxed(runtime.acc, &runtime.state.outstanding);
-            if(outstanding != 0u)
-                return;
-            if(loadDeviceRelaxed(runtime.acc, &runtime.state.partialBuffers) != 0u)
-                return;
-            if(loadDeviceRelaxed(runtime.acc, &runtime.state.inFlightReservations) != 0u)
-                return;
-            if(loadDeviceRelaxed(runtime.acc, &runtime.state.stagingCount) != 0u)
-                return;
-            std::uint64_t const violations = runtime.ring.ownershipViolations();
-            if(violations != 0u)
+            CompiledStream const* stream = findCompiledStream(runtime.graph, streamId);
+            if(stream == nullptr || stream->consumerCount == 0u)
             {
-                runtime.state.readyViolations = violations;
-                recordError(runtime, PoolError::readyRingViolation);
-                requestStop(runtime, poolStoppingAborted);
-                return;
+                if(runtime.warp.isLeader())
+                    recordError(runtime, PoolError::internalState);
+                return false;
             }
-            (void) exchangeDevice(runtime.acc, &runtime.state.stopReason, poolStoppingDrained);
+            configureRecord(runtime, handle, elementCount);
+            bool ok = true;
+            for(std::uint32_t index = 0u; ok && index < stream->consumerCount; ++index)
+            {
+                CompiledPortBinding const& binding = runtime.graph.streamConsumers[stream->firstConsumer + index];
+                if(binding.node.value >= runtime.graph.nodeCount)
+                {
+                    if(runtime.warp.isLeader())
+                        recordError(runtime, PoolError::internalState);
+                    return false;
+                }
+                CompiledNode const& destination = runtime.graph.nodes[binding.node.value];
+                JobDescriptor next{};
+                next.operation = destination.operation;
+                next.kind = JobKind::OPERATION;
+                next.packet = handle;
+                next.routing.inputPort = binding.port;
+                next.routing.outputPort = 0u;
+                next.routing.outputPortCount = destination.outputPortCount;
+                next.request = RequestSpec{0u, 0u, seed};
+                next.sequenceNumber = sequenceNumber;
+                if(runtime.warp.isLeader())
+                {
+                    (void) addDevice(runtime.acc, &runtime.state.outstanding, std::uint64_t{1u});
+                    (void) addDevice(runtime.acc, &runtime.state.publications, std::uint64_t{1u});
+                }
+                RingStatus const status = enqueueWithRetry(runtime, next);
+                if(status != RingStatus::Accepted)
+                {
+                    if(runtime.warp.isLeader())
+                        orDevice(runtime.acc, &runtime.state.errorWord, publicationError(status));
+                    ok = false;
+                }
+            }
+            return ok;
+        }
+
+        /** Acquire a packet slot with a bounded attempt budget.
+         *
+         * Unlike `acquireWithRetry`, a failure is reported instead of spinning
+         * forever. The drain path uses it so a transiently exhausted pool
+         * makes the worker retry the quiescence step instead of wedging the
+         * persistent launch. Warp-uniform.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline bool acquireBounded(
+            SchedulerRuntime<T_Acc>& runtime,
+            PacketHandle& handle,
+            std::uint32_t attempts) noexcept
+        {
+            for(std::uint32_t attempt = 0u; attempt < attempts; ++attempt)
+            {
+                if(runtime.pool.acquire(runtime.acc, runtime.warp, handle))
+                    return true;
+                devicePause(runtime.args.idleNanosleep);
+            }
+            return false;
+        }
+
+        /** Initialize one A/B chunk pair per compiled stream.
+         *
+         * The two slots come from the packet pool's free list, so a published
+         * chunk keeps a real packet handle and travels downstream without a
+         * copy. Runs in the initializer block before `initDone` is published.
+         * Warp-uniform.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline bool initializeAssembly(SchedulerRuntime<T_Acc>& runtime) noexcept
+        {
+            if(runtime.args.assemblyStorage == nullptr)
+                return runtime.graph.streamCount == 0u;
+            Assembly assembler = makeAssembly(runtime);
+            if(assembler.streamCount() != runtime.graph.streamCount)
+                return false;
+            std::uint32_t const capacityBytes = runtime.args.chunkCapacity * runtime.args.packetSchema.elementSize;
+            bool ok = true;
+            for(std::uint32_t index = 0u; ok && index < runtime.graph.streamCount; ++index)
+            {
+                PacketHandle first{};
+                PacketHandle second{};
+                if(!acquireWithRetry(runtime, first))
+                {
+                    if(runtime.warp.isLeader())
+                        recordError(runtime, PoolError::packetExhausted);
+                    return false;
+                }
+                configureChunkRecord(runtime, first);
+                if(!acquireWithRetry(runtime, second))
+                {
+                    if(runtime.warp.isLeader())
+                        recordError(runtime, PoolError::packetExhausted);
+                    return false;
+                }
+                configureChunkRecord(runtime, second);
+                ok = assembler.initialize(
+                    runtime.acc,
+                    runtime.warp,
+                    index,
+                    runtime.graph.streams[index].id,
+                    makeAssemblySlot(first, capacityBytes),
+                    makeAssemblySlot(second, capacityBytes));
+            }
+            return ok;
+        }
+
+        /** One quiescence observation, with an optional drain step.
+         *
+         * Warp-uniform. A single leader takes the drain lock (the
+         * `inFlightReservations` control word), so the observation and any
+         * drain publication form one transaction: no other worker can publish a
+         * chunk or observe the same inconsistent state in between. If a
+         * non-empty partial buffer exists, one chunk is detached with its real
+         * length, released as an ordinary job with a fresh replacement chunk
+         * attached to the stream, and the step returns without stopping. A
+         * particle that returns during the drain therefore creates a new
+         * partial buffer and a later round sees it. The drained stop flag is
+         * set only when one observation shows no pending sources, no outstanding
+         * jobs, no staged imports, and no non-empty partial buffer.
+         *
+         * @return true when the worker must leave the scheduling loop.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline bool quiescenceStep(SchedulerRuntime<T_Acc>& runtime, std::uint32_t blockIndex) noexcept
+        {
+            auto const& warp = runtime.warp;
+            bool const leader = warp.isLeader();
+
+            std::uint32_t locked = 0u;
+            if(leader)
+            {
+                std::uint64_t const closed = loadDeviceAcquire(runtime.acc, &runtime.state.closedSeen);
+                std::uint64_t const pendingSources = loadDeviceAcquire(runtime.acc, &runtime.state.pendingSources);
+                std::uint64_t const outstanding = loadDeviceAcquire(runtime.acc, &runtime.state.outstanding);
+                std::uint64_t const staging = loadDeviceAcquire(runtime.acc, &runtime.state.stagingCount);
+                if(closed != 0u && pendingSources == 0u && outstanding == 0u && staging == 0u)
+                {
+                    locked = alpaka::onAcc::atomicCas(
+                                 runtime.acc,
+                                 &runtime.state.inFlightReservations,
+                                 std::uint64_t{0u},
+                                 std::uint64_t{1u},
+                                 alpaka::onAcc::scope::device)
+                                     == 0u
+                                 ? 1u
+                                 : 0u;
+                }
+            }
+            // Reconverge after the leader-only CAS before the shuffle.
+            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
+            locked = warp.template broadcast<std::uint32_t>(locked, 0u);
+            if(locked == 0u)
+                return false;
+
+            std::uint32_t action = 0u; // 0 none, 1 stop, 2 drain, 3 abort
+            std::uint32_t drainStream = 0u;
+            if(leader)
+            {
+                std::uint64_t const closed = loadDeviceAcquire(runtime.acc, &runtime.state.closedSeen);
+                std::uint64_t const pendingSources = loadDeviceAcquire(runtime.acc, &runtime.state.pendingSources);
+                std::uint64_t const outstanding = loadDeviceAcquire(runtime.acc, &runtime.state.outstanding);
+                std::uint64_t const staging = loadDeviceAcquire(runtime.acc, &runtime.state.stagingCount);
+                if(closed != 0u && pendingSources == 0u && outstanding == 0u && staging == 0u)
+                {
+                    std::uint64_t const packetViolations = runtime.pool.ownershipViolations();
+                    std::uint64_t const violations = runtime.ring.ownershipViolations();
+                    if(packetViolations != 0u)
+                    {
+                        recordError(runtime, PoolError::internalState);
+                        action = 3u;
+                    }
+                    else if(violations != 0u)
+                    {
+                        runtime.state.readyViolations = violations;
+                        recordError(runtime, PoolError::readyRingViolation);
+                        action = 3u;
+                    }
+                    else
+                    {
+                        // Pair with the release fence of the last commit before
+                        // reading the stream counters. Without it a drain scan
+                        // can miss a just-committed partial buffer and stop the
+                        // pool with data still buffered.
+                        alpaka::onAcc::memFence(
+                            runtime.acc,
+                            alpaka::onAcc::scope::device,
+                            alpaka::onAcc::order::acquire);
+                        Assembly assembler = makeAssembly(runtime);
+                        std::uint64_t partials = 0u;
+                        for(std::uint32_t index = 0u; index < assembler.streamCount(); ++index)
+                        {
+                            if(assembler.stream(index).count != 0u)
+                            {
+                                if(partials == 0u)
+                                    drainStream = index;
+                                ++partials;
+                            }
+                        }
+                        runtime.state.partialBuffers = partials;
+                        action = partials == 0u ? 1u : 2u;
+                    }
+                }
+            }
+            // Reconverge after the leader-only observation before distributing
+            // the decision through shuffles.
+            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
+            action = warp.template broadcast<std::uint32_t>(action, 0u);
+            drainStream = warp.template broadcast<std::uint32_t>(drainStream, 0u);
+
+            if(action == 3u)
+            {
+                if(leader)
+                    requestStop(runtime, poolStoppingAborted);
+                return true;
+            }
+            if(action == 1u)
+            {
+                if(leader)
+                {
+                    (void) exchangeDevice(runtime.acc, &runtime.state.inFlightReservations, std::uint64_t{0u});
+                    (void) exchangeDevice(runtime.acc, &runtime.state.stopReason, poolStoppingDrained);
+                }
+                return true;
+            }
+            if(action == 2u)
+            {
+                Assembly assembler = makeAssembly(runtime);
+                std::uint32_t const capacityBytes = runtime.args.chunkCapacity * runtime.args.packetSchema.elementSize;
+                PacketHandle replacement{};
+                bool const acquired = acquireBounded(runtime, replacement, 64u);
+                if(!acquired)
+                {
+                    if(leader)
+                        (void) exchangeDevice(runtime.acc, &runtime.state.inFlightReservations, std::uint64_t{0u});
+                    return false;
+                }
+                configureChunkRecord(runtime, replacement);
+                AssemblySlot published{};
+                FlushStatus const status = assembler.flushPartial(
+                    runtime.acc,
+                    warp,
+                    drainStream,
+                    blockIndex + 1u,
+                    makeAssemblySlot(replacement, capacityBytes),
+                    published);
+                if(status == FlushStatus::Published)
+                {
+                    std::uint64_t seed = 0u;
+                    if(leader)
+                        seed = assembler.stream(drainStream).seed;
+                    seed = warp.template broadcast<std::uint64_t>(seed, 0u);
+                    std::uint32_t const elementCount = published.count / runtime.args.packetSchema.elementSize;
+                    if(leader)
+                    {
+                        (void) addDevice(runtime.acc, &runtime.state.drainPublications, std::uint64_t{1u});
+                        (void) addDevice(runtime.acc, &runtime.state.drainRounds, std::uint64_t{1u});
+                    }
+                    bool const ok = publishChunk(
+                        runtime,
+                        assembler.stream(drainStream).id,
+                        published.handle,
+                        elementCount,
+                        seed,
+                        static_cast<std::uint64_t>(drainStream) + 1u);
+                    if(!ok)
+                    {
+                        if(leader)
+                        {
+                            recordError(runtime, PoolError::internalState);
+                            requestStop(runtime, poolStoppingAborted);
+                        }
+                        return true;
+                    }
+                }
+                else
+                {
+                    // Nothing was detached (count raced to zero) or the claim
+                    // was busy: return the replacement to the pool.
+                    bool const released = runtime.pool.release(runtime.acc, warp, replacement);
+                    if(leader)
+                    {
+                        if(!released)
+                            recordError(runtime, PoolError::internalState);
+                        (void) addDevice(runtime.acc, &runtime.state.slotsReturned, std::uint64_t{1u});
+                    }
+                }
+                if(leader)
+                    (void) exchangeDevice(runtime.acc, &runtime.state.inFlightReservations, std::uint64_t{0u});
+                return false;
+            }
+            if(leader)
+                (void) exchangeDevice(runtime.acc, &runtime.state.inFlightReservations, std::uint64_t{0u});
+            return false;
         }
 
         /** Bind the device operation table and publish the init flag.
@@ -447,6 +811,9 @@ namespace graph
                     runtime.state.debugBudgetWorkers = runtime.args.budget.workers;
                 }
                 bool const configured = runtime.pool.configure(runtime.acc, runtime.warp, runtime.args.budget);
+                // The A/B chunk pairs come from the pool's free list, so this
+                // runs after configure() and before any worker can claim work.
+                bool const assembled = configured ? initializeAssembly(runtime) : false;
                 // The pool configure already distributed `configured` through
                 // its own handoff; the remaining startup flags follow through a
                 // second handoff so no lane depends on a shuffle.
@@ -460,8 +827,11 @@ namespace graph
                     runtime.state.initWinner = blockIndex;
                     local.configured = configured ? 1u : 0u;
                     local.bound = T_Binder::bind(runtime.acc, runtime.table) ? 1u : 0u;
-                    local.ready = (local.configured != 0u && local.bound != 0u) ? 1u : 0u;
+                    local.assembled = assembled ? 1u : 0u;
+                    local.ready = (local.configured != 0u && local.bound != 0u && local.assembled != 0u) ? 1u : 0u;
                     if(local.configured == 0u)
+                        recordError(runtime, PoolError::internalState);
+                    if(local.assembled == 0u)
                         recordError(runtime, PoolError::internalState);
                     if(local.bound == 0u)
                         recordError(runtime, PoolError::unknownOperation);
@@ -824,75 +1194,104 @@ namespace graph
                 }
             }
 
-            // One successor per outgoing edge. Pool-core forwards the same
-            // packet in place; per-destination output sizes are the chunk
-            // assembly milestone.
-            for(std::uint32_t index = 0u; ok && index < node->outputEdgeCount; ++index)
-            {
-                std::uint32_t const edgeIndex = runtime.graph.outputEdges[node->firstOutputEdge + index];
-                CompiledEdge const& edge = runtime.graph.edges[edgeIndex];
-                CompiledNode const& destination = runtime.graph.nodes[edge.to.value];
-                JobDescriptor next = makeSuccessor(edge, destination, job);
-                next.packet = ownedPacket;
-                if(runtime.warp.isLeader())
-                {
-                    (void) addDevice(runtime.acc, &runtime.state.outstanding, std::uint64_t{1u});
-                    (void) addDevice(runtime.acc, &runtime.state.publications, std::uint64_t{1u});
-                }
-                RingStatus const status = enqueueWithRetry(runtime, next);
-                if(status != RingStatus::Accepted)
-                {
-                    if(runtime.warp.isLeader())
-                        orDevice(runtime.acc, &runtime.state.errorWord, publicationError(status));
-                    ok = false;
-                }
-            }
-
-            if(node->outputEdgeCount == 0u)
-            {
-                // Pool-core retirement is accounting only: the packet pool's
-                // slots are not recycled inside one pool lifetime. Acyclic runs
-                // are bounded by the validated slot budget, and per-stream slot
-                // recycling needs the chunk-assembly ownership protocol (next
-                // milestone). Teardown releases the whole allocation.
-                if(runtime.warp.isLeader())
-                    (void) addDevice(runtime.acc, &runtime.state.retiredPackets, std::uint64_t{1u});
-            }
+            // Outgoing data is not forwarded in place. `executeJob()` owns the
+            // per-destination assembly: it appends the reported elements to
+            // each stream and publishes every full chunk itself. Only the
+            // resumable source range is handled here.
             return ok;
         }
 
         /** Execute one claimed job with every lane of the warp.
          *
-         * The operation's functor writes its output elements to the output
-         * packet spans the accessor resolves (the functors keep writing to their
-         * output ports). For a node that assembles chunks, the scheduler owns
-         * the per-destination chunk state and, after the functor returns,
-         * copies the produced elements into the stream's reserved range,
-         * commits the counter, rotates the chunk pair, and publishes the filled
-         * chunk downstream as a real packet with its true element count
-         * (design section 6). Count publication and A/B slot rotation live in
-         * the scheduler; the per-particle transformation stays in the functor.
+         * The funnel ABI stays unchanged: the functor writes into the output
+         * spans the accessor resolves and reports one warp-uniform element
+         * count per port. The scheduler then owns per-destination chunk
+         * assembly (design section 6):
+         *
+         * 1. read the reported count of every outgoing edge,
+         * 2. reserve all destination ranges or none,
+         * 3. copy the produced elements into the reserved logical range,
+         * 4. commit the counter and rotate the A/B pair, publishing every full
+         *    chunk as an ordinary ready job with its real element count,
+         * 5. retire the input packet exactly once and return unused scratch
+         *    slots to the pool.
+         *
+         * A failed reservation leaves every stream and counter unchanged and
+         * the step retries without re-running the functor. A count that
+         * exceeds the port capacity or names a port without storage is the
+         * named `packetExceedsCapacity` error, never a silent over-read.
          */
         template<typename T_Acc>
-        ALPAKA_FN_ACC inline bool executeJob(SchedulerRuntime<T_Acc>& runtime, JobDescriptor const& job) noexcept
+        ALPAKA_FN_ACC inline bool executeJob(
+            SchedulerRuntime<T_Acc>& runtime,
+            JobDescriptor const& job,
+            std::uint32_t blockIndex) noexcept
         {
             using Acc = typename SchedulerRuntime<T_Acc>::Acc;
+            auto const& warp = runtime.warp;
+            bool const leader = warp.isLeader();
+            std::uint32_t const elementSize = runtime.args.packetSchema.elementSize;
+            std::uint32_t const capacityBytes = runtime.args.chunkCapacity * elementSize;
+
             CompiledNode const* node = findNode(runtime.graph, job.operation);
-            bool const isSource = node != nullptr && node->isSource;
-            // A non-source job names the packet it reads. Reject a handle whose
-            // generation no longer matches the slot: executing it would read a
-            // packet the job does not own.
+            if(node == nullptr)
+            {
+                if(leader)
+                    recordError(runtime, PoolError::unknownOperation);
+                return false;
+            }
+            bool const isSource = node->isSource;
             if(!isSource && !packetHandleValid(runtime, job.packet))
                 return false;
+
+            std::uint32_t const ports
+                = node->outputPortCount < maxPacketPorts - 1u ? node->outputPortCount : maxPacketPorts - 1u;
             PacketAccessor accessor{};
+            accessor.clear();
+            PacketHandle scratch[maxPacketPorts]{};
+            bool hasScratch[maxPacketPorts]{};
             if(job.packet.index < static_cast<std::uint32_t>(poolPacketSlotCapacity))
             {
                 PacketRecord const record = runtime.pool.observedRecord(runtime.acc, job.packet);
                 void* data = runtime.pool.slotData(job.packet);
-                if(!isSource)
+                if(isSource)
+                {
+                    // A source writes into the packet the importer acquired for
+                    // its request range; that slot is its output scratch.
+                    if(ports != 0u)
+                    {
+                        accessor.setOutput(0u, &record, data);
+                        scratch[0] = job.packet;
+                        hasScratch[0] = true;
+                    }
+                }
+                else
+                {
                     accessor.setInput(job.routing.inputPort, &record, data);
-                for(std::uint32_t port = 0u; port < job.routing.outputPortCount && port + 1u < maxPacketPorts; ++port)
-                    accessor.setOutput(port, &record, data);
+                }
+            }
+            else
+            {
+                if(leader)
+                    recordError(runtime, PoolError::internalState);
+                return false;
+            }
+            if(!isSource)
+            {
+                for(std::uint32_t port = 0u; port < ports; ++port)
+                {
+                    PacketHandle handle{};
+                    if(!acquireWithRetry(runtime, handle))
+                    {
+                        if(leader)
+                            recordError(runtime, PoolError::packetExhausted);
+                        return false;
+                    }
+                    configureOutputRecord(runtime, handle);
+                    scratch[port] = handle;
+                    hasScratch[port] = true;
+                    accessor.setOutput(port, &runtime.pool.slotRecord(handle), runtime.pool.slotData(handle));
+                }
             }
             // Reserved control port: never a stream, never part of routing.
             accessor.inputData[maxPacketPorts - 1u] = runtime.args.controlBlock;
@@ -900,17 +1299,252 @@ namespace graph
             OperationFn<Acc> const function = runtime.table.resolve(job.operation);
             if(function == nullptr)
             {
-                if(runtime.warp.isLeader())
+                if(leader)
                     recordError(runtime, PoolError::unknownOperation);
                 return false;
             }
-
-            // The functor writes its outputs to the spans the accessor resolves.
-            // The count and the A/B slot rotation are the scheduler's job for an
-            // assembly node; a source or sink writes its slot(s) directly.
             function(runtime.acc, job, accessor);
-            if(runtime.warp.isLeader() && job.operation.value < 8u)
+            // The functor contains leader-only regions and lane-strided loops;
+            // under CUDA's independent thread scheduling the warp can return
+            // from the indirect call split. Converge before any lane reads a
+            // per-lane count or runs a count-dependent loop, or the leader can
+            // reach the next block barrier while other lanes are still in a
+            // count-dependent loop.
+            runtime.barrier.barrier(runtime.acc, runtime.blockThreads, warp);
+            if(leader && job.operation.value < 8u)
                 (void) addDevice(runtime.acc, &runtime.state.execCounts[job.operation.value], std::uint64_t{1u});
+
+            // Read the reported counts and build one append request per
+            // outgoing edge. Each output port maps to exactly one destination
+            // stream; a duplicate would append the same bytes twice.
+            Assembly assembler = makeAssembly(runtime);
+            AppendRequest requests[maxAssemblyTargets]{};
+            std::uint32_t requestPorts[maxAssemblyTargets]{};
+            AssemblySlot replacements[maxAssemblyTargets]{};
+            std::uint32_t requestCount = 0u;
+            for(std::uint32_t index = 0u; index < node->outputEdgeCount; ++index)
+            {
+                std::uint32_t const edgeIndex = runtime.graph.outputEdges[node->firstOutputEdge + index];
+                CompiledEdge const& edge = runtime.graph.edges[edgeIndex];
+                std::uint32_t const port = edge.outputPort;
+                if(port >= ports || !hasScratch[port] || accessor.outputRecord(port) == nullptr)
+                {
+                    if(leader)
+                        recordError(runtime, PoolError::packetExceedsCapacity);
+                    return false;
+                }
+                // The functor reports a warp-uniform count; broadcast it so
+                // every lane uses the same value even if a backend keeps the
+                // mutable accessor copy in per-lane local memory.
+                std::uint32_t const count = warp.template broadcast<std::uint32_t>(accessor.outputCount(port), 0u);
+                if(count == 0u)
+                    continue;
+                if(count > runtime.args.chunkCapacity || requestCount >= maxAssemblyTargets)
+                {
+                    if(leader)
+                        recordError(runtime, PoolError::packetExceedsCapacity);
+                    return false;
+                }
+                for(std::uint32_t other = 0u; other < requestCount; ++other)
+                {
+                    if(requests[other].stream == edge.stream)
+                    {
+                        if(leader)
+                            recordError(runtime, PoolError::internalState);
+                        return false;
+                    }
+                }
+                requests[requestCount] = AppendRequest{edge.stream, count * elementSize};
+                requestPorts[requestCount] = port;
+                replacements[requestCount] = makeAssemblySlot(scratch[port], capacityBytes);
+                ++requestCount;
+            }
+
+            // Dedicated replacement chunks: one per destination target. The
+            // functor output scratch is copied into the reserved range and is
+            // then always returned to the pool; it never becomes a stream
+            // chunk. This keeps the two ownership roles (functor scratch vs.
+            // stream chunk) disjoint, so a released scratch can never be a
+            // chunk another job already owns.
+            for(std::uint32_t request = 0u; request < requestCount; ++request)
+            {
+                PacketHandle replacement{};
+                if(!acquireWithRetry(runtime, replacement))
+                {
+                    if(leader)
+                        recordError(runtime, PoolError::packetExhausted);
+                    return false;
+                }
+                configureChunkRecord(runtime, replacement);
+                replacements[request] = makeAssemblySlot(replacement, capacityBytes);
+            }
+            AssemblySlot publications[maxAssemblyTargets]{};
+            AssemblyReservation reservation{};
+            bool committed = false;
+            constexpr std::uint32_t maxReserveAttempts = 1u << 16u;
+            for(std::uint32_t attempt = 0u; !committed && attempt < maxReserveAttempts; ++attempt)
+            {
+                reservation = AssemblyReservation{};
+                AppendStatus const status = reservation.tryReserve(
+                    runtime.acc,
+                    warp,
+                    blockIndex + 1u,
+                    assembler,
+                    requests,
+                    requestCount,
+                    replacements,
+                    requestCount,
+                    publications,
+                    maxAssemblyTargets);
+                if(status == AppendStatus::StreamBusy)
+                {
+                    devicePause(runtime.args.idleNanosleep);
+                    continue;
+                }
+                if(status != AppendStatus::Ok)
+                {
+                    if(leader)
+                        recordError(runtime, PoolError::internalState);
+                    return false;
+                }
+
+                bool copyOk = true;
+                std::uint32_t const width = warp.workerWidth();
+                for(std::uint32_t target = 0u; target < requestCount; ++target)
+                {
+                    auto* source = static_cast<AssemblyElement*>(accessor.outputData[requestPorts[target]]);
+                    // A uniform round count keeps every lane in the same loop
+                    // iteration. A lane-strided `byte < itemCount` loop can
+                    // leave lanes at different program points under CUDA's
+                    // independent thread scheduling, and the following
+                    // block barrier would then wait for lanes that never
+                    // arrive.
+                    std::uint32_t const rounds = (requests[target].itemCount + width - 1u) / width;
+                    for(std::uint32_t round = 0u; round < rounds; ++round)
+                    {
+                        std::uint32_t const byte = round * width + warp.laneIndex();
+                        if(byte >= requests[target].itemCount)
+                            continue;
+                        AssemblyElement* destination = reservation.writePointer(target, byte);
+                        if(destination == nullptr)
+                            copyOk = false;
+                        else
+                            *destination = source[byte];
+                    }
+                }
+                if(!copyOk)
+                {
+                    reservation.cancel(runtime.acc, warp);
+                    if(leader)
+                        recordError(runtime, PoolError::packetExceedsCapacity);
+                    return false;
+                }
+                if(!reservation.commit(runtime.acc, warp))
+                {
+                    // A competing writer committed in between; the reservation
+                    // released every claim and mutated nothing. Retry.
+                    devicePause(runtime.args.idleNanosleep);
+                    continue;
+                }
+                committed = true;
+
+                std::uint32_t publicationCount = 0u;
+                for(std::uint32_t target = 0u; target < requestCount; ++target)
+                    publicationCount += reservation.rotates(target) ? 1u : 0u;
+                std::uint32_t cursor = 0u;
+                for(std::uint32_t target = 0u; target < requestCount; ++target)
+                {
+                    if(!reservation.rotates(target))
+                        continue;
+                    std::uint32_t slot = 0u;
+                    std::uint32_t count = 0u;
+                    std::uint32_t handleIndex = 0u;
+                    std::uint32_t handleGeneration = 0u;
+                    if(leader && cursor < publicationCount)
+                    {
+                        slot = publications[cursor].slot;
+                        count = publications[cursor].count;
+                        handleIndex = publications[cursor].handle.index;
+                        handleGeneration = publications[cursor].handle.generation;
+                    }
+                    slot = warp.template broadcast<std::uint32_t>(slot, 0u);
+                    count = warp.template broadcast<std::uint32_t>(count, 0u);
+                    handleIndex = warp.template broadcast<std::uint32_t>(handleIndex, 0u);
+                    handleGeneration = warp.template broadcast<std::uint32_t>(handleGeneration, 0u);
+                    ++cursor;
+                    PacketHandle const publishedHandle{handleIndex, handleGeneration};
+                    std::uint32_t const elementCount = count / elementSize;
+                    if(!publishChunk(
+                           runtime,
+                           requests[target].stream,
+                           publishedHandle,
+                           elementCount,
+                           job.request.seed,
+                           job.sequenceNumber + 1u))
+                    {
+                        if(leader)
+                            recordError(runtime, PoolError::internalState);
+                        return false;
+                    }
+                }
+                // Remember the request seed of every destination stream so a
+                // drain-published partial chunk keeps the deterministic stream
+                // key of the run.
+                if(leader)
+                {
+                    for(std::uint32_t target = 0u; target < requestCount; ++target)
+                        assembler.stream(reservation.target(target).streamIndex).seed = job.request.seed;
+                }
+            }
+            if(!committed)
+            {
+                if(leader)
+                    recordError(runtime, PoolError::internalState);
+                return false;
+            }
+
+            // Retire exactly once. All functor scratch slots are released;
+            // the replacement chunks consumed by a rotation stay with their
+            // stream, and unused replacements return to the pool. The input
+            // packet of a non-source job is released separately; for a source
+            // its output scratch is that same packet.
+            std::uint32_t rotates = 0u;
+            for(std::uint32_t target = 0u; target < requestCount; ++target)
+                rotates += reservation.rotates(target) ? 1u : 0u;
+            for(std::uint32_t port = 0u; port < ports; ++port)
+            {
+                if(!hasScratch[port])
+                    continue;
+                bool const released = runtime.pool.release(runtime.acc, warp, scratch[port]);
+                if(leader)
+                {
+                    if(!released)
+                        recordError(runtime, PoolError::internalState);
+                    (void) addDevice(runtime.acc, &runtime.state.slotsReturned, std::uint64_t{1u});
+                    (void) addDevice(runtime.acc, &runtime.state.retiredPackets, std::uint64_t{1u});
+                }
+            }
+            for(std::uint32_t replacement = rotates; replacement < requestCount; ++replacement)
+            {
+                bool const released = runtime.pool.release(runtime.acc, warp, replacements[replacement].handle);
+                if(leader)
+                {
+                    if(!released)
+                        recordError(runtime, PoolError::internalState);
+                    (void) addDevice(runtime.acc, &runtime.state.slotsReturned, std::uint64_t{1u});
+                }
+            }
+            if(!isSource)
+            {
+                bool const released = runtime.pool.release(runtime.acc, warp, job.packet);
+                if(leader)
+                {
+                    if(!released)
+                        recordError(runtime, PoolError::internalState);
+                    (void) addDevice(runtime.acc, &runtime.state.slotsReturned, std::uint64_t{1u});
+                    (void) addDevice(runtime.acc, &runtime.state.retiredPackets, std::uint64_t{1u});
+                }
+            }
             return true;
         }
 
@@ -922,24 +1556,28 @@ namespace graph
             while(true)
             {
                 if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
+                {
+                    if(runtime.warp.isLeader())
+                        return;
+                }
+
+                // Every worker honors the mapped host abort word, not only the
+                // importer block. A diagnostic abort must stop a stuck idle
+                // worker as well, and the read is warp-uniform on every lane.
+                if(hostAbortRequested(runtime))
+                {
+                    if(runtime.warp.isLeader())
+                    {
+                        recordError(runtime, PoolError::aborted);
+                        requestStop(runtime, poolStoppingAborted, 6u);
+                    }
                     return;
+                }
 
                 bool didWork = false;
                 if(blockIndex == 0u)
                 {
                     importerStep(runtime);
-                    // Uniform across the warp: every lane observes the mapped
-                    // abort word, so the branch cannot diverge before the next
-                    // collective.
-                    bool const hostAborted = hostAbortRequested(runtime);
-                    if(hostAborted)
-                    {
-                        if(runtime.warp.isLeader())
-                        {
-                            recordError(runtime, PoolError::aborted);
-                            requestStop(runtime, poolStoppingAborted, 6u);
-                        }
-                    }
                     if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
                         return;
                 }
@@ -959,7 +1597,7 @@ namespace graph
                     }
                     // Order the leader's acquire before any lane reads packet data.
                     runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
-                    bool const executed = executeJob(runtime, job);
+                    bool const executed = executeJob(runtime, job, blockIndex);
                     // Order every lane's stores before the leader publishes or retires.
                     runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
                     bool published = false;
@@ -990,8 +1628,8 @@ namespace graph
                 else
                 {
                     ++idleIterations;
-                    if(idleIterations >= 4u)
-                        tryQuiesce(runtime);
+                    if(idleIterations >= 4u && quiescenceStep(runtime, blockIndex))
+                        return;
                     devicePause(runtime.args.idleNanosleep);
                 }
             }

@@ -47,7 +47,7 @@
  * is a singly linked stack of slots; the `next` pointer of a free slot lives in
  * the slot's own free-list field, and the head is a tagged word.
  *
- * - `freeListHead` packs a 31-bit slot index with a 1-bit tag. A push (release)
+ * - `freeListHead` packs a 32-bit slot index with a 32-bit epoch. A push (release)
  *   CAS-exchanges `index | (tag << 31)` into the head; a pop (acquire) reads
  *   the head, walks the slot's `next`, and CAS-exchanges the successor into the
  *   head. The tag distinguishes `invalidSlotIndex` (the terminator) from a
@@ -280,15 +280,25 @@ namespace graph
 
         /** Pool header. Each word owns its own 64-byte cache line.
          *
-         * `freeListHead` is a tagged word: bit 31 is the tag, bits 0..30 are
-         * the slot index. `0` (index 0, tag 0) is the initial head after
+         * `freeListHead` is a tagged word: bits 32..63 are an epoch, bits
+         * 0..31 are the slot index. `0` (index 0, tag 0) is the initial head after
          * `configure()`; the terminator is `1u << 31` (tag 1, no index).
          * `freeCount`, `violations`, and `headVersion` are device-scope atomic
          * words updated with `atomicAdd`/`atomicCas` from multiple warps.
          */
         struct PoolHeader
         {
-            std::uint32_t freeListHead{0u};
+            /**
+             * Free-list head: low 32 bits are the slot index, high 32 bits are
+             * a monotonically increasing epoch.
+             *
+             * The epoch is what closes the ABA window. A one-bit tag derived
+             * from the successor (the previous form) allowed a stale CAS to
+             * succeed after the head had cycled back to the same index, and
+             * handed one slot to two owners. Every successful head change now
+             * bumps the epoch.
+             */
+            std::uint64_t freeListHead{0u};
             std::uint64_t padHead[7]{};
             std::uint64_t freeCount{0u};
             std::uint64_t padFree[7]{};
@@ -353,7 +363,7 @@ namespace graph
                 auto* hdr = &header();
                 if(requiredSlots(budget) > static_cast<std::uint32_t>(T_SlotCapacity))
                 {
-                    hdr->freeListHead = headTag;
+                    hdr->freeListHead = encodeHead(invalidSlotIndex, 0u);
                     hdr->freeCount = 0u;
                     hdr->violations = 1u;
                     hdr->headVersion = 0u;
@@ -376,7 +386,7 @@ namespace graph
                     hdr->casFailures = 0u;
                     hdr->metaChecks = 0u;
                     hdr->freeCount = static_cast<std::uint64_t>(T_SlotCapacity);
-                    hdr->freeListHead = 0u; // index 0, tag 0
+                    hdr->freeListHead = encodeHead(0u, 0u); // index 0, epoch 0
                     for(std::size_t i = 0u; i < T_SlotCapacity; ++i)
                     {
                         auto* slot = &slotAt(i);
@@ -572,29 +582,30 @@ namespace graph
         }
 
     private:
-        /** Tag bit of the free-list head: distinguishes the terminator
-         *  (tag 1, no index) from a real slot (tag 0). The free list never
-         *  pushes `invalidSlotIndex`, so the tag is the sole terminator mark. */
-        static constexpr std::uint32_t headTag = 1u << 31u;
-        static constexpr std::uint32_t headIndexMask = 0x7fff'ffffu;
+        static constexpr std::uint32_t headInvalidIndex = invalidSlotIndex;
 
-        /** Encode a slot index plus tag into the head word. */
-        static constexpr std::uint32_t encodeHead(std::uint32_t index, std::uint32_t tag) noexcept
+        /** Encode a slot index plus epoch into the 64-bit head word. */
+        static constexpr std::uint64_t encodeHead(std::uint32_t index, std::uint32_t epoch) noexcept
         {
-            return (index & headIndexMask) | (tag << 31u);
+            return (static_cast<std::uint64_t>(epoch) << 32u) | static_cast<std::uint64_t>(index);
         }
 
-        /** Decode the slot index of a head word (masked to 31 bits so a
-         *  terminator word decodes to a value the caller rejects). */
-        static constexpr std::uint32_t headIndex(std::uint32_t head) noexcept
+        /** Decode the slot index of a head word. */
+        static constexpr std::uint32_t headIndex(std::uint64_t head) noexcept
         {
-            return head & headIndexMask;
+            return static_cast<std::uint32_t>(head);
+        }
+
+        /** Decode the epoch of a head word. */
+        static constexpr std::uint32_t headEpoch(std::uint64_t head) noexcept
+        {
+            return static_cast<std::uint32_t>(head >> 32u);
         }
 
         /** True when the head word is the terminator (no free slot). */
-        static constexpr bool headIsTerminator(std::uint32_t head) noexcept
+        static constexpr bool headIsTerminator(std::uint64_t head) noexcept
         {
-            return (head & headTag) != 0u;
+            return headIndex(head) == headInvalidIndex;
         }
 
         /** Maximum number of CAS retries in popSlot. A failed CAS means
@@ -624,7 +635,7 @@ namespace graph
                 // Read the head with a raw volatile load: the value is only a
                 // candidate for the CAS that follows, and a stale read is safe
                 // because the CAS re-validates it atomically.
-                std::uint32_t const expected = *reinterpret_cast<std::uint32_t volatile*>(&hdr->freeListHead);
+                std::uint64_t const expected = *reinterpret_cast<std::uint64_t volatile*>(&hdr->freeListHead);
                 if(headIsTerminator(expected))
                     return false;
                 std::uint32_t const index = headIndex(expected);
@@ -643,11 +654,17 @@ namespace graph
                 // terminator tag. The tag is what closes the ABA window: a
                 // stale CAS against a head that has cycled through the same
                 // index fails because the tag differs.
-                std::uint32_t const desiredTag = (next == invalidSlotIndex) ? 1u : 0u;
-                std::uint32_t const desired = encodeHead(next, desiredTag);
-                std::uint32_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
+                std::uint32_t const desiredEpoch = headEpoch(expected) + 1u;
+                std::uint64_t const desired = encodeHead(next, desiredEpoch);
+                std::uint64_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
                 if(result == expected)
                 {
+                    // A free slot must be inactive. Observing an active slot
+                    // here means the same slot was handed to two owners: the
+                    // exact double-ownership failure this pool must never
+                    // produce. Record it instead of silently overwriting.
+                    if(slot->meta.active != 0u)
+                        (void) pool_detail::atomicAddDevice(acc, &hdr->violations, std::uint64_t{1u});
                     // CAS succeeded: commit the slot's meta and record.
                     // The meta stores are safe now: this warp owns the slot
                     // (it just advanced the head), and no other warp can pop
@@ -701,43 +718,61 @@ namespace graph
                 (void) pool_detail::atomicAddDevice(acc, &hdr->violations, std::uint64_t{1u});
                 return false;
             }
+            // Serialize releases of one slot. Two threads holding the same
+            // handle used to be able to prepare and push the slot concurrently:
+            // the loser's CAS failed, it restored `active` on a slot that the
+            // winner had already published, and the retry then linked the slot
+            // to itself. That free-list self-loop handed one slot to several
+            // owners. The transition 1 -> 2 claims the single release right;
+            // a second releaser observes 0/2 and fails instead of mutating the
+            // list.
+            if(pool_detail::atomicCasDevice(acc, &slot->meta.active, std::uint32_t{1u}, std::uint32_t{2u})
+               != std::uint32_t{1u})
+            {
+                (void) pool_detail::atomicAddDevice(acc, &hdr->violations, std::uint64_t{1u});
+                return false;
+            }
+            if(slot->meta.generation != handle.generation)
+            {
+                slot->meta.active = 1u;
+                (void) pool_detail::atomicAddDevice(acc, &hdr->violations, std::uint64_t{1u});
+                return false;
+            }
             for(std::uint32_t attempt = 0u; attempt < maxPopAttempts; ++attempt)
             {
-                std::uint32_t const expected = *reinterpret_cast<std::uint32_t volatile*>(&hdr->freeListHead);
-                // Link this slot at the head: its next field points at the
-                // current head's index (or the terminator). This must happen
-                // BEFORE the CAS: a concurrent popper reads the successor
-                // from the slot once the head points to it, so the successor
-                // must already be written.
+                std::uint64_t const expected = *reinterpret_cast<std::uint64_t volatile*>(&hdr->freeListHead);
+                // All slot state must be final *before* the head CAS makes the
+                // slot reachable. A concurrent popper can pop this slot and
+                // write its own meta immediately after the CAS succeeds; a
+                // post-CAS meta store by this pusher would then clear `active`
+                // and bump the generation of a slot that is already owned by
+                // that popper. That exact race allowed a live packet to look
+                // free and to be handed to a second owner, so the push commits
+                // `active = 0` and the generation bump first and restores them
+                // only when the CAS fails (the slot is private until then).
                 slot->record.handle.index = headIsTerminator(expected) ? invalidSlotIndex : headIndex(expected);
                 slot->record.handle.generation = 0u;
                 slot->record.elementCount = 0u;
                 slot->record.schema = ElementSchema{};
-                // Release the record before the head CAS so the popper
-                // observes the new successor.
+                slot->meta.active = 0u;
+                slot->meta.generation += 1u;
+                // Publish the link, the record, and the meta before the head
+                // CAS. The popper acquires after observing the new head.
                 pool_detail::publishRelease(acc);
-                // CAS the head: this slot becomes the new head.
-                std::uint32_t const desired = encodeHead(handle.index, 0u);
-                std::uint32_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
+                std::uint32_t const desiredEpoch = headEpoch(expected) + 1u;
+                std::uint64_t const desired = encodeHead(handle.index, desiredEpoch);
+                std::uint64_t const result = pool_detail::atomicCasDevice(acc, &hdr->freeListHead, expected, desired);
                 if(result == expected)
                 {
-                    // CAS succeeded: commit the meta. Clear active and bump
-                    // the generation so a stale handle no longer matches.
-                    // The meta stores are after the CAS: if the CAS had
-                    // failed, the generation bump would have made the handle
-                    // stale without the slot being on the free list.
-                    slot->meta.active = 0u;
-                    slot->meta.generation += 1u;
-                    pool_detail::publishRelease(acc);
                     (void) pool_detail::atomicAddDevice(acc, &hdr->headVersion, std::uint32_t{1u});
                     (void) pool_detail::atomicAddDevice(acc, &hdr->freeCount, std::uint64_t{1u});
                     return true;
                 }
-                // CAS failed: another warp moved the head. The record stores
-                // above (successor, elementCount, schema) are harmless: the
-                // slot is not on the free list (the CAS failed), so no
-                // popper reads them. The meta is untouched, so the handle
-                // is still valid for a retry.
+                // CAS failed: another warp moved the head and never published
+                // this slot. We still hold the release claim, so restore the
+                // private state (2 = being released) and retry.
+                slot->meta.active = 2u;
+                slot->meta.generation -= 1u;
                 (void) pool_detail::atomicAddDevice(acc, &hdr->casFailures, std::uint64_t{1u});
             }
             return false;

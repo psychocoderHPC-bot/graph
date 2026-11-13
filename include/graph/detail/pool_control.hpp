@@ -399,6 +399,7 @@ namespace graph
             alignas(128) std::uint32_t debugConfigured{0u};
             alignas(128) std::uint32_t debugStopStage{0u};
             alignas(128) std::uint64_t workerBits[poolMaxWorkers / 64u]{};
+
             /** Peak number of packet slots held at once (diagnostic). */
             alignas(128) std::uint64_t peakHeldSlots{0u};
             /** Number of packet slots returned to the pool during the run. */

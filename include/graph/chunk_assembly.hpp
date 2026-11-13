@@ -135,6 +135,20 @@ namespace graph
         T* storage{nullptr};
         std::uint32_t slotCount{0u};
         std::uint32_t elementCapacity{0u};
+        /**
+         * Distance between two slots in elements.
+         *
+         * The pool-backed arena reuses packet-pool slots whose payload stride
+         * is larger than the logical chunk capacity. Zero keeps the historic
+         * packed layout (`stride == elementCapacity`); the scheduler sets an
+         * explicit stride when it overlays the arena on the packet pool.
+         */
+        std::uint32_t elementStride{0u};
+
+        ALPAKA_FN_HOST_ACC constexpr std::uint32_t stride() const noexcept
+        {
+            return elementStride != 0u ? elementStride : elementCapacity;
+        }
 
         /** True when `chunk` names a slot of this arena with the arena's capacity. */
         ALPAKA_FN_HOST_ACC constexpr bool contains(ChunkSlot<T> const& chunk) const noexcept
@@ -146,7 +160,7 @@ namespace graph
         /** Element pointer of the first element of `chunk`. */
         ALPAKA_FN_HOST_ACC constexpr T* data(ChunkSlot<T> const& chunk) const noexcept
         {
-            return storage + static_cast<std::size_t>(chunk.slot) * static_cast<std::size_t>(elementCapacity);
+            return storage + static_cast<std::size_t>(chunk.slot) * static_cast<std::size_t>(stride());
         }
     };
 
@@ -170,6 +184,15 @@ namespace graph
         std::uint32_t version{0u};
         /** Set when a terminal partial flush detached the last chunk. */
         bool drained{false};
+        /**
+         * Request seed of the last append.
+         *
+         * A drain-published partial chunk has no parent job to inherit a
+         * request from, so the scheduler remembers the stream's deterministic
+         * key here. Single-seed runs use it unchanged; a multi-seed producer
+         * would need per-element state instead.
+         */
+        std::uint64_t seed{0u};
     };
 
     static_assert(std::is_trivially_copyable_v<AssemblyStream<float>>);
@@ -335,9 +358,17 @@ namespace graph
                     state.claim = 0u;
                     state.version = 1u;
                     state.drained = false;
+                    state.seed = 0u;
                     ok = true;
                 }
             }
+            // A leader-only region can leave the warp in two convergence
+            // groups under CUDA's independent thread scheduling. Shuffles do
+            // not reconverge them, so synchronize before the broadcast.
+            auto const blockThreads = static_cast<std::uint32_t>(
+                acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+            WarpBarrier<T_Acc> convergence{};
+            convergence.barrier(acc, blockThreads, warp);
             return broadcastBool(warp, ok);
         }
 
@@ -430,6 +461,12 @@ namespace graph
                 {
                     status = static_cast<std::uint32_t>(FlushStatus::InvalidOwnerToken);
                 }
+            }
+            // Reconverge after the leader-only claim/apply region before any
+            // shuffle distributes the result.
+            {
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
             }
             status = warp.template broadcast<std::uint32_t>(status, 0u);
             result.slot = warp.template broadcast<std::uint32_t>(result.slot, 0u);
@@ -620,6 +657,14 @@ namespace graph
                 status = static_cast<std::uint32_t>(result);
                 m_status = result == AppendStatus::Ok ? Status::Pending : Status::Failed;
             }
+            // Reconverge after the leader-only reserve region before the
+            // shuffles that distribute the plan.
+            {
+                auto const blockThreads = static_cast<std::uint32_t>(
+                    acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
+            }
             status = warp.template broadcast<std::uint32_t>(status, 0u);
             m_targetCount = warp.template broadcast<std::uint32_t>(m_targetCount, 0u);
             m_ownerToken = warp.template broadcast<std::uint32_t>(m_ownerToken, 0u);
@@ -761,6 +806,12 @@ namespace graph
                     m_status = ok ? Status::Committed : Status::Failed;
                 }
             }
+            // Reconverge after the leader-only apply region before the result
+            // is distributed through a shuffle.
+            {
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
+            }
             ok = warp.template broadcast<std::uint32_t>(ok ? 1u : 0u, 0u) != 0u;
             m_status = static_cast<Status>(
                 warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(m_status), 0u));
@@ -788,6 +839,14 @@ namespace graph
                     }
                 }
                 m_status = Status::Cancelled;
+            }
+            // Reconverge after the leader-only claim release before the status
+            // shuffle.
+            {
+                auto const blockThreads = static_cast<std::uint32_t>(
+                    acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+                WarpBarrier<T_Acc> convergence{};
+                convergence.barrier(acc, blockThreads, warp);
             }
             m_status = static_cast<Status>(
                 warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(m_status), 0u));
