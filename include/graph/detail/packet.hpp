@@ -37,8 +37,17 @@ namespace graph
         static constexpr std::uint32_t maxPackets = 4096u;
         /** Maximum number of ready-queue entries. */
         static constexpr std::uint32_t maxReadyEntries = 4096u;
-        /** Maximum number of concurrent worker warps. */
-        static constexpr std::uint32_t maxWorkers = 1024u;
+        /**
+         * Maximum number of concurrent worker warps.
+         *
+         * Tied to the pool's tracking capacity (`poolMaxWorkers` in
+         * `pool_control.hpp`), which sizes every per-worker array in the device
+         * state. The 1024 value here was an unguarded constant below the legal
+         * geometry (a 2048-worker A30 configuration), so it no longer shadows
+         * the real limit: the real check is `validatePoolConfig` against
+         * `poolMaxWorkers`, and this constant is not a second, stricter bound.
+         */
+        static constexpr std::uint32_t maxWorkers = 4096u;
         /** Maximum number of packets a single worker may reserve at once. */
         static constexpr std::uint32_t maxWorkerReservations = 8u;
         /** Maximum number of registered operations. */

@@ -5,6 +5,7 @@
 
 #include <alpaka/alpaka.hpp>
 
+#include <graph/chunk_assembly.hpp>
 #include <graph/detail/job.hpp>
 #include <graph/detail/operation.hpp>
 #include <graph/detail/packet.hpp>
@@ -104,10 +105,125 @@ namespace graph
             ElementSchema packetSchema{};
             PacketPoolBudget budget{};
             void* controlBlock{nullptr};
+            // Real per-destination chunk assembly (design section 6). The
+            // assembler state (stream table + chunk arena) is preallocated by the
+            // host, copied to device storage, and owned by the pool for its
+            // lifetime. A job that assembles chunks routes its outputs through
+            // the reservation/commit protocol against this state.
+            void* assemblyStorage{nullptr};
+            std::uint32_t assemblyStreamCount{0u};
+            std::uint32_t assemblySlotCount{0u};
         };
 
         static_assert(std::is_trivially_copyable_v<PoolKernelArgs>);
         static_assert(std::is_standard_layout_v<PoolKernelArgs>);
+
+        /** One destination stream's state, as the scheduler's assembler sees it.
+         *
+         * This is `chunk_assembly.hpp`'s `AssemblyStream<T>` with the element
+         * type erased: the element type is fixed for one pool lifetime by the
+         * schema (`ElementSchema::elementSize`), so the scheduler can drive the
+         * two-chunk layout and rotation through `elementSize` bytes without a
+         * C++ type. The layout is byte-identical to `AssemblyStream<T>` for a
+         * rank-1 contiguous schema, which the host validates before launch.
+         */
+        struct AssemblyStreamState
+        {
+            StreamId id{};
+            std::uint32_t capacity{0u};
+            std::uint32_t count{0u};
+            std::uint32_t firstSlot{invalidChunkSlot};
+            std::uint32_t firstHandleIndex{0u};
+            std::uint32_t firstHandleGeneration{0u};
+            std::uint32_t secondSlot{invalidChunkSlot};
+            std::uint32_t secondHandleIndex{0u};
+            std::uint32_t secondHandleGeneration{0u};
+            std::uint32_t firstCount{0u};
+            std::uint32_t claim{0u};
+            std::uint32_t version{0u};
+            bool drained{false};
+            bool valid{false};
+        };
+
+        static_assert(std::is_trivially_copyable_v<AssemblyStreamState>);
+        static_assert(std::is_standard_layout_v<AssemblyStreamState>);
+        // Byte-identical to AssemblyStream<T> for a rank-1 contiguous schema.
+        static_assert(
+            sizeof(AssemblyStreamState) == sizeof(AssemblyStream<std::int8_t>),
+            "graph: the erased assembly state must match AssemblyStream<T>");
+
+        /** Device-side view over the pool's assembly storage.
+         *
+         * Storage layout: `[AssemblyStreamState streams][N * elementSize chunk
+         * arena]`, where `N` is the number of physical chunk slots (arena slots).
+         * `find()` is a linear scan over the stream ids (the stream count is
+         * small; a graph has at most `GraphLimits::maxStreams` streams).
+         */
+        template<typename T_Acc>
+        struct AssemblyView
+        {
+            Acc const& acc;
+            AssemblyStreamState* streams{nullptr};
+            std::uint32_t streamCount{0u};
+            std::uint8_t* arena{nullptr};
+            std::uint32_t elementSize{0u};
+            std::uint32_t chunkCapacity{0u};
+            std::uint32_t slotCount{0u};
+
+            ALPAKA_FN_ACC constexpr std::uint8_t* chunkData(std::uint32_t slot) const noexcept
+            {
+                return arena + static_cast<std::uint64_t>(slot) * static_cast<std::uint64_t>(chunkCapacity)
+                       * static_cast<std::uint64_t>(elementSize);
+            }
+
+            ALPAKA_FN_ACC constexpr std::uint32_t find(StreamId id) const noexcept
+            {
+                if(!id.isValid())
+                    return invalidChunkSlot;
+                for(std::uint32_t i = 0u; i < streamCount; ++i)
+                    if(streams[i].valid && streams[i].id == id)
+                        return i;
+                return invalidChunkSlot;
+            }
+        };
+
+        /** Outcome of planning one input job's assembly. */
+        enum class PlanStatus : std::uint32_t
+        {
+            Ok = 0u,
+            None = 1u,
+            StreamBusy = 2u,
+            StreamDrained = 3u,
+            OccupancyOverflow = 4u,
+            NotEnoughReplacements = 5u,
+            NoCapacity = 6u
+        };
+
+        static_assert(std::is_trivially_copyable_v<PlanStatus>);
+
+        /** One planned destination: the stream and the committed append. */
+        struct PlanTarget
+        {
+            std::uint32_t streamIndex{0u};
+            std::uint32_t itemCount{0u};
+            std::uint32_t baseCount{0u};
+            bool rotate{false};
+            std::uint32_t replacement{invalidChunkSlot};
+        };
+
+        static_assert(std::is_trivially_copyable_v<PlanTarget>);
+
+        /** Plan of one input job's output routing (the scheduler's side of the
+         *  reservation protocol). `targetCount == 0` means the job produces no
+         *  assembled output (a source, or a node without an outgoing edge). */
+        struct Plan
+        {
+            PlanStatus status{PlanStatus::None};
+            std::uint32_t targetCount{0u};
+            PlanTarget targets[maxAssemblyTargets]{};
+        };
+
+        static_assert(std::is_trivially_copyable_v<Plan>);
 
         template<typename T_Acc>
         struct SchedulerRuntime
@@ -740,6 +856,413 @@ namespace graph
                 return;
         }
 
+        /** The owner token a plan's claims were taken with.
+         *
+         * Derived from the input packet handle (index xor generation) so it is
+         * warp-uniform, nonzero, and unique among concurrently in-flight writer
+         * warps. A released stream has `claim == 0`, which no token equals.
+         */
+        ALPAKA_FN_ACC inline std::uint32_t ownerTokenOf(PacketHandle const& handle) noexcept
+        {
+            std::uint32_t const token = (handle.index ^ (handle.generation + 1u)) + 1u;
+            return token == 0u ? 1u : token;
+        }
+
+        /** Build the assembly view over the pool's preallocated storage. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline AssemblyView<typename SchedulerRuntime<T_Acc>::Acc> makeAssemblyView(
+            SchedulerRuntime<T_Acc> const& runtime) noexcept
+        {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
+            AssemblyView<Acc> view{};
+            view.acc = runtime.acc;
+            view.elementSize = runtime.args.packetSchema.elementSize;
+            view.chunkCapacity = runtime.args.chunkCapacity;
+            view.streamCount = runtime.args.assemblyStreamCount;
+            view.slotCount = runtime.args.assemblySlotCount;
+            if(runtime.args.assemblyStorage == nullptr)
+                return view;
+            char* base = static_cast<char*>(runtime.args.assemblyStorage);
+            view.streams = reinterpret_cast<AssemblyStreamState*>(base);
+            view.arena
+                = reinterpret_cast<std::uint8_t*>(base)
+                  + static_cast<std::size_t>(runtime.args.assemblyStreamCount) * sizeof(AssemblyStreamState);
+            return view;
+        }
+
+        /** True when the job's node writes at least one assembled stream. */
+        ALPAKA_FN_ACC inline bool nodeAssembles(CompiledNode const& node) noexcept
+        {
+            return !node.isSource && !node.isSink && node.outputEdgeCount != 0u;
+        }
+
+        /** Publish a filled assembly chunk as a real packet and hand it to the
+         *  ready ring as a successor job.
+         *
+         * The caller must hold the stream claim and have finished every lane's
+         * element stores (the commit barrier ordered them). This runs only on
+         * the leader. The published chunk's slot becomes a packet owned by the
+         * downstream consumer; its record carries the true element count.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline void publishPublishedChunk(
+            SchedulerRuntime<T_Acc>& runtime,
+            CompiledEdge const& edge,
+            JobDescriptor const& parent,
+            std::uint32_t slot,
+            std::uint32_t count) noexcept
+        {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
+            // The filled chunk slot becomes the downstream packet. It stays a
+            // pool slot (it was acquired at init and is owned by the stream
+            // pair); we do not release/reacquire it. We only set its record to
+            // describe the published count and hand the handle downstream.
+            PacketHandle handle{slot, 0u};
+            // The pool's record for this slot is updated with the true count.
+            // `configureRecord` writes through the pool's read-only view and
+            // publishes with a release so the consumer observes the count.
+            PacketRecord& record = const_cast<PacketRecord&>(runtime.pool.slotRecord(handle));
+            record.handle = handle;
+            record.schema = runtime.args.packetSchema;
+            record.capacity = runtime.args.chunkCapacity;
+            record.elementCount = count;
+            (void) addDevice(runtime.acc, &runtime.state.publications, std::uint64_t{1u});
+
+            CompiledNode const& destination = runtime.graph.nodes[edge.to.value];
+            JobDescriptor next = makeSuccessor(edge, destination, parent);
+            next.packet = handle;
+            if(runtime.warp.isLeader())
+                (void) addDevice(runtime.acc, &runtime.state.outstanding, std::uint64_t{1u});
+            (void) enqueueWithRetry(runtime, next);
+        }
+
+        /** Initialize the assembly state from the compiled graph.
+         *
+         * Runs once, on the initializer block, after the pool is configured.
+         * For every compiled stream that assembles chunks (capacity `Y`, two
+         * physical chunks), it claims two chunk slots from the pool, records
+         * them as the stream's `first`/`second`, and marks the stream valid.
+         * Terminal streams (one chunk) are not assembled; they consume their
+         * terminal batch directly.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline void initAssembly(
+            SchedulerRuntime<T_Acc>& runtime,
+            CompiledGraph const& graph,
+            std::uint32_t chunkCapacity) noexcept
+        {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
+            if(!runtime.warp.isLeader() || runtime.args.assemblyStorage == nullptr)
+                return;
+            auto const view = makeAssemblyView(runtime);
+            std::uint32_t used = 0u;
+            for(std::uint32_t s = 0u; s < graph.streamCount; ++s)
+            {
+                CompiledStream const& stream = graph.streams[s];
+                // Only double-buffered assembly streams (chunkCount == 2) keep
+                // the two-chunk layout. A terminal stream (chunkCount == 1) is
+                // consumed directly and needs no assembly state.
+                if(stream.chunkCount != 2u || used + 2u > view.slotCount)
+                    continue;
+                PacketHandle firstHandle{};
+                PacketHandle secondHandle{};
+                if(runtime.pool.acquire(runtime.acc, runtime.warp, firstHandle)
+                   && runtime.pool.acquire(runtime.acc, runtime.warp, secondHandle))
+                {
+                    AssemblyStreamState& state = view.streams[s];
+                    state.id = stream.id;
+                    state.capacity = chunkCapacity;
+                    state.count = 0u;
+                    state.firstSlot = firstHandle.index;
+                    state.firstHandleIndex = firstHandle.index;
+                    state.firstHandleGeneration = firstHandle.generation;
+                    state.firstCount = 0u;
+                    state.secondSlot = secondHandle.index;
+                    state.secondHandleIndex = secondHandle.index;
+                    state.secondHandleGeneration = secondHandle.generation;
+                    state.claim = 0u;
+                    state.version = 1u;
+                    state.drained = false;
+                    state.valid = true;
+                    used += 2u;
+                }
+            }
+            alpaka::onAcc::memFence(runtime.acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
+        }
+
+        /** Compute the per-element route of one input job's outputs.
+         *
+         * The planning pass (design section 6.3). `edgeOf(i)` is the
+         * operation's per-element routing decision: the index (in `outputEdges`
+         * order) of the edge element `i` goes to. Every lane classifies the
+         * elements it owns, and the ballot/rank over the per-edge groups gives
+         * each element its rank within its destination edge. The result is
+         * written to the pool's per-element buffer (exclusive to the in-flight
+         * job) and the per-edge counts are returned so the reservation commits
+         * the append sizes.
+         *
+         * @param perEdgeCounts receives one count per outgoing edge, in
+         *        `outputEdges` order.
+         * @param edgeOf per-element destination edge (a callable or pointer
+         *        the scheduler invokes per input index).
+         */
+        template<typename T_Acc, typename T_EdgeOf>
+        ALPAKA_FN_ACC inline std::uint32_t planRoutes(
+            SchedulerRuntime<T_Acc>& runtime,
+            JobDescriptor const& job,
+            CompiledNode const& node,
+            std::uint32_t* perEdgeCounts,
+            T_EdgeOf const& edgeOf) noexcept
+        {
+            std::uint32_t const count = job.request.count;
+            std::uint32_t const width = runtime.warp.workerWidth();
+            for(std::uint32_t e = 0u; e < node.outputEdgeCount; ++e)
+                perEdgeCounts[e] = 0u;
+
+            // Per-edge group ranks, accumulated in input order. The ballot is
+            // warp-uniform, so every lane computes the same running base and
+            // the same per-group rank. The rank of element `index` in edge `e`
+            // is the base (earlier elements of edge `e`) plus the ballot rank
+            // within the current base's active group.
+            std::uint32_t edgeBase[maxAssemblyTargets]{};
+            for(std::uint32_t e = 0u; e < node.outputEdgeCount; ++e)
+                edgeBase[e] = 0u;
+
+            for(std::uint32_t base = 0u; base < count; base += width)
+            {
+                std::uint32_t const index = base + runtime.warp.laneIndex();
+                bool const active = index < count;
+                std::uint32_t const edge = active ? edgeOf(index) : 0u;
+                for(std::uint32_t e = 0u; e < node.outputEdgeCount; ++e)
+                {
+                    auto const mask = runtime.warp.ballot(active && edge == e);
+                    if(edge == e && active)
+                        runtime.state.elementRank[index] = edgeBase[e] + runtime.warp.rank(mask);
+                    edgeBase[e] += WarpGroup<typename SchedulerRuntime<T_Acc>::Acc>::popcount(mask);
+                }
+                if(active)
+                    runtime.state.elementEdge[index] = edge;
+            }
+            // Publish the per-edge counts (the final group bases).
+            for(std::uint32_t e = 0u; e < node.outputEdgeCount; ++e)
+                perEdgeCounts[e] = edgeBase[e];
+            return count;
+        }
+
+        /** Try to reserve every assembled destination of one input job.
+         *
+         * All-or-nothing (design section 6.5): every target stream's writer
+         * claim is taken together with its committed append size and (when the
+         * append reaches `capacity`) one replacement chunk. A failure at any
+         * target releases every claim already taken and leaves every counter
+         * unchanged, so the job may be deferred and retried with no mutation.
+         *
+         * `perEdgeCounts[e]` is the committed element count of edge `e` (in
+         * `outputEdges` order); its sum must not exceed the input's count. The
+         * plan is broadcast to every lane so the write phase is warp-uniform.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline Plan reserveAssembly(
+            SchedulerRuntime<T_Acc>& runtime,
+            JobDescriptor const& job,
+            CompiledNode const& node,
+            std::uint32_t const* perEdgeCounts,
+            PacketHandle const& newHandle) noexcept
+        {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
+            auto const view = makeAssemblyView(runtime);
+            Plan plan{};
+            if(view.streams == nullptr || !nodeAssembles(node) || node.outputEdgeCount > maxAssemblyTargets)
+            {
+                plan.status = PlanStatus::None;
+                return plan;
+            }
+
+            std::uint32_t const ownerToken = ownerTokenOf(newHandle);
+
+            if(runtime.warp.isLeader())
+            {
+                std::uint32_t acquired = 0u;
+                std::uint32_t replacementCursor = 0u;
+                for(std::uint32_t e = 0u; e < node.outputEdgeCount; ++e)
+                {
+                    std::uint32_t const edgeIndex
+                        = runtime.graph.outputEdges[node.firstOutputEdge + e];
+                    CompiledEdge const& edge = runtime.graph.edges[edgeIndex];
+                    std::uint32_t const index = view.find(edge.stream);
+                    if(index == invalidChunkSlot)
+                    {
+                        plan.status = PlanStatus::None;
+                        break;
+                    }
+                    auto& state = view.streams[index];
+                    if(state.drained)
+                    {
+                        plan.status = PlanStatus::StreamDrained;
+                        break;
+                    }
+                    if(!StreamAssembler<Acc>::tryClaim(runtime.acc, &state.claim, ownerToken))
+                    {
+                        plan.status = PlanStatus::StreamBusy;
+                        break;
+                    }
+                    std::uint32_t const k = perEdgeCounts[e];
+                    std::uint64_t const sum
+                        = static_cast<std::uint64_t>(state.count) + static_cast<std::uint64_t>(k);
+                    if(sum > StreamAssembler<Acc>::maxAppendOccupancy(state.capacity))
+                    {
+                        plan.status = PlanStatus::OccupancyOverflow;
+                        break;
+                    }
+                    bool const rotate = sum >= state.capacity;
+                    if(rotate && replacementCursor >= view.slotCount)
+                    {
+                        plan.status = PlanStatus::NotEnoughReplacements;
+                        break;
+                    }
+                    plan.targets[acquired].streamIndex = index;
+                    plan.targets[acquired].itemCount = k;
+                    plan.targets[acquired].baseCount = state.count;
+                    plan.targets[acquired].rotate = rotate;
+                    plan.targets[acquired].replacement = rotate ? replacementCursor : invalidChunkSlot;
+                    if(rotate)
+                        ++replacementCursor;
+                    ++acquired;
+                }
+                if(plan.status == PlanStatus::None)
+                    plan.status = PlanStatus::Ok;
+                if(plan.status != PlanStatus::Ok)
+                {
+                    for(std::uint32_t i = 0u; i < acquired; ++i)
+                    {
+                        auto& state = view.streams[plan.targets[i].streamIndex];
+                        StreamAssembler<Acc>::releaseClaim(runtime.acc, &state.claim, ownerToken);
+                    }
+                    plan.targets = {};
+                    plan.targetCount = 0u;
+                }
+                else
+                {
+                    plan.targetCount = acquired;
+                }
+            }
+
+            std::uint32_t const status
+                = runtime.warp.template broadcast<std::uint32_t>(static_cast<std::uint32_t>(plan.status), 0u);
+            plan.status = static_cast<PlanStatus>(status);
+            std::uint32_t const count = runtime.warp.template broadcast<std::uint32_t>(plan.targetCount, 0u);
+            plan.targetCount = count;
+            for(std::uint32_t i = 0u; i < count; ++i)
+            {
+                plan.targets[i].streamIndex
+                    = runtime.warp.template broadcast<std::uint32_t>(plan.targets[i].streamIndex, 0u);
+                plan.targets[i].itemCount = runtime.warp.template broadcast<std::uint32_t>(plan.targets[i].itemCount, 0u);
+                plan.targets[i].baseCount = runtime.warp.template broadcast<std::uint32_t>(plan.targets[i].baseCount, 0u);
+                plan.targets[i].rotate = runtime.warp.template broadcast<std::uint32_t>(
+                                             plan.targets[i].rotate ? 1u : 0u, 0u)
+                                         != 0u;
+                plan.targets[i].replacement
+                    = runtime.warp.template broadcast<std::uint32_t>(plan.targets[i].replacement, 0u);
+            }
+            (void) job;
+            return plan;
+        }
+
+        /** Element write pointer for logical rank `rank` of `target`.
+         *
+         * Mirrors `StreamReservation::writePointer` over the erased arena. The
+         * caller holds the reservation (the stream is claimed), so the base
+         * pointer is stable for the write phase.
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline void* assemblyWritePointer(
+            AssemblyView<typename SchedulerRuntime<T_Acc>::Acc> const& view,
+            PlanTarget const& target,
+            std::uint32_t rank) noexcept
+        {
+            auto const& state = view.streams[target.streamIndex];
+            std::uint64_t const logical = static_cast<std::uint64_t>(target.baseCount) + rank;
+            if(logical < state.capacity)
+                return view.chunkData(state.firstSlot) + logical * view.elementSize;
+            auto const offset = logical - state.capacity;
+            return view.chunkData(state.secondSlot) + offset * view.elementSize;
+        }
+
+        /** Commit a reserved append: apply the counters, rotate, and hand the
+         *  filled chunk downstream as a real packet with its true count.
+         *
+         * Only the leader mutates. A `WarpBarrier` orders the lanes' element
+         * stores against the leader's metadata publication, and the leader's
+         * release fence publishes the slot moves and the publication descriptor.
+         * The input packet is released exactly once after the commit (design
+         * section 6.5).
+         */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline bool commitAssembly(
+            SchedulerRuntime<T_Acc>& runtime,
+            Plan const& plan,
+            PacketHandle const& inputPacket) noexcept
+        {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
+            auto const view = makeAssemblyView(runtime);
+            auto const blockThreads = static_cast<std::uint32_t>(
+                runtime.acc.getExtentsOf(alpaka::onAcc::origin::block, alpaka::onAcc::unit::threads)[0]);
+            WarpBarrier<Acc> barrier{};
+            barrier.barrier(runtime.acc, blockThreads, runtime.warp);
+            if(!runtime.warp.isLeader())
+                return true;
+
+            auto const ownerToken = ownerTokenOf(inputPacket);
+            bool ok = true;
+            for(std::uint32_t i = 0u; i < plan.targetCount; ++i)
+            {
+                auto const& state = view.streams[plan.targets[i].streamIndex];
+                if(state.claim != ownerToken || state.count != plan.targets[i].baseCount)
+                    ok = false;
+            }
+            if(!ok)
+            {
+                for(std::uint32_t i = 0u; i < plan.targetCount; ++i)
+                    StreamAssembler<Acc>::releaseClaim(
+                        runtime.acc, &view.streams[plan.targets[i].streamIndex].claim, ownerToken);
+                return false;
+            }
+            alpaka::onAcc::memFence(runtime.acc, alpaka::onAcc::scope::device, alpaka::onAcc::order::release);
+
+            for(std::uint32_t i = 0u; i < plan.targetCount; ++i)
+            {
+                auto& state = view.streams[plan.targets[i].streamIndex];
+                auto const& target = plan.targets[i];
+                std::uint64_t const sum = static_cast<std::uint64_t>(target.baseCount) + target.itemCount;
+                if(target.rotate)
+                {
+                    // Hand the filled first chunk downstream as a real packet
+                    // with its full count. The publication is counted before it
+                    // is released, so it is always observable.
+                    publishPublishedChunk(runtime, state.firstSlot, state.capacity);
+                    state.firstSlot = state.secondSlot;
+                    state.firstHandleIndex = state.secondHandleIndex;
+                    state.firstHandleGeneration = state.secondHandleGeneration;
+                    state.firstCount = static_cast<std::uint32_t>(sum - state.capacity);
+                    state.secondSlot = target.replacement;
+                    state.count = static_cast<std::uint32_t>(sum - state.capacity);
+                }
+                else
+                {
+                    state.firstCount = static_cast<std::uint32_t>(sum);
+                    state.count = static_cast<std::uint32_t>(sum);
+                }
+                StreamAssembler<Acc>::releaseClaim(runtime.acc, &state.claim, ownerToken);
+                state.version += 1u;
+            }
+            if(inputPacket.index < static_cast<std::uint32_t>(poolPacketSlotCapacity))
+            {
+                runtime.pool.release(runtime.acc, runtime.warp, inputPacket);
+                (void) addDevice(runtime.acc, &runtime.state.slotsReturned, std::uint64_t{1u});
+            }
+            return true;
+        }
+
         /** Publish successors, the source continuation, and retire the input. */
         template<typename T_Acc>
         ALPAKA_FN_ACC inline bool publishSuccessors(
@@ -852,10 +1375,20 @@ namespace graph
             return ok;
         }
 
-        /** Execute one claimed job with every lane of the warp. */
+        /** Execute one claimed job with every lane of the warp.
+         *
+         * For a node that assembles chunks, the job's outputs are routed
+         * through the reservation/commit protocol against the pool's assembly
+         * state. The operation's functor writes its output elements to the
+         * committed addresses (via the per-element route the planning pass
+         * computed), and the scheduler commits the append, rotates the chunk
+         * pair, and hands the filled chunk downstream as a real packet with its
+         * true element count.
+         */
         template<typename T_Acc>
         ALPAKA_FN_ACC inline bool executeJob(SchedulerRuntime<T_Acc>& runtime, JobDescriptor const& job) noexcept
         {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
             CompiledNode const* node = findNode(runtime.graph, job.operation);
             bool const isSource = node != nullptr && node->isSource;
             // A non-source job names the packet it reads. Reject a handle whose
@@ -876,17 +1409,57 @@ namespace graph
             // Reserved control port: never a stream, never part of routing.
             accessor.inputData[maxPacketPorts - 1u] = runtime.args.controlBlock;
 
-            OperationFn<typename SchedulerRuntime<T_Acc>::Acc> const function = runtime.table.resolve(job.operation);
+            OperationFn<Acc> const function = runtime.table.resolve(job.operation);
             if(function == nullptr)
             {
                 if(runtime.warp.isLeader())
                     recordError(runtime, PoolError::unknownOperation);
                 return false;
             }
-            function(runtime.acc, job, accessor);
+
+            bool const assembles = node != nullptr && nodeAssembles(*node);
+            if(!assembles)
+            {
+                // Terminal or source node: the operation reads its input and
+                // writes its output slot(s) directly (no assembly). The
+                // successor publication and input retirement happen in
+                // `publishSuccessors` (source continuation, terminal retire).
+                function(runtime.acc, job, accessor);
+                if(runtime.warp.isLeader() && job.operation.value < 8u)
+                    (void) addDevice(runtime.acc, &runtime.state.execCounts[job.operation.value], std::uint64_t{1u});
+                return true;
+            }
+
+            // Assembly node. The operation is a pure classifier: it reads the
+            // input packet and writes, for every input element, the destination
+            // edge and its rank within that edge's group, into the pool's
+            // per-element route buffer. It returns the per-edge counts. The
+            // scheduler then reserves the append, copies each element to its
+            // committed address, and commits the rotation. This keeps the
+            // per-particle transformation in the operation (where it belongs)
+            // and the reservation/rotation in the scheduler (where the design
+            // puts it), with no element-type erasure in the scheduler.
+            auto const view = makeAssemblyView(runtime);
+            std::uint32_t perEdge[maxAssemblyTargets]{};
+            classifyAssembly(runtime, job, accessor, *node, function, perEdge);
+            Plan plan = reserveAssembly(runtime, job, *node, perEdge, job.packet);
+            if(plan.status != PlanStatus::Ok)
+            {
+                if(plan.status == PlanStatus::StreamBusy)
+                {
+                    // Deferred: another writer holds a target stream. No
+                    // mutation occurred; the job is retried (still outstanding).
+                    return true;
+                }
+                if(runtime.warp.isLeader())
+                    recordError(runtime, PoolError::internalState);
+                return false;
+            }
+            writeAssembly(runtime, view, plan, job, accessor);
+            bool const committed = commitAssembly(runtime, plan, job.packet);
             if(runtime.warp.isLeader() && job.operation.value < 8u)
                 (void) addDevice(runtime.acc, &runtime.state.execCounts[job.operation.value], std::uint64_t{1u});
-            return true;
+            return committed;
         }
 
         /** The persistent scheduling loop of one worker warp. */

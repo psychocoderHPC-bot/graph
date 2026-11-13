@@ -264,12 +264,14 @@ namespace graph
         {
             if(warp.isLeader())
             {
-                auto* hdr = &header();
-                hdr->lock = 0u;
-                hdr->pushCounter = 0u;
-                hdr->claimCounter = 0u;
-                hdr->violations = 0u;
-                for(std::size_t i = 0u; i < T_Capacity; ++i)
+            auto* hdr = &header();
+            // Zero the whole header, including the padding words between the
+            // atomic fields. The host copies the header back after the kernel
+            // stops and reports it; any non-zero padding byte is initcheck
+            // noise (a stale line from the allocation) that a later run reads
+            // as spurious data.
+            std::memset(&header(), 0, headerBytes);
+            for(std::size_t i = 0u; i < T_Capacity; ++i)
                 {
                     slotAt(i).sequence = 0u;
                     slotAt(i).entry = ReadyEntry{};
