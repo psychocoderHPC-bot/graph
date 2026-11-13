@@ -17,16 +17,19 @@ histogram. The project validates on a CPU backend and on an NVIDIA GPU.
 
 ## Status
 
-Implemented and green at this commit (HAL acceptance record:
-`docs/hal-acceptance.md`): the build, the library sources, the unit and
-integration tests, and the hardware gates. The CPU and CUDA CTest suites pass
-(119/119 and 127/127), and the CUDA suite covers the residency rendezvous, the
-copy-queue overlap, the chunk-assembly publication guard, the ready-ring
-cross-warp visibility, and the particle-gpu kernel comparison. Format and REUSE
-pass.
+The CPU CTest suite passes (140/140). The CUDA suite registers 156 tests; 154
+pass on the measurement host. The two failures are the persistent-pool GPU
+cases (`pool gpu one launch...` and `pool gpu full-capacity pressure...`);
+`pool gpu resumes from idle...` is intermittent. They are a packet-pool
+free-list visibility defect, not the packet-handle path, and are recorded in
+`docs/known-limitations.md`. The rest of the CUDA suite covers the residency
+rendezvous, the copy-queue overlap, the chunk-assembly publication guard, the
+ready-ring cross-warp visibility, and the particle-gpu kernel comparison.
+Format (clang-format 20.1.8) and REUSE pass.
 
-Pending at this commit: the host `Pool` object and the persistent pool kernel
-that combine ingestion, claim, dispatch, and drain into one launch; the
+The host `Pool` object (`include/graph/pool.hpp`) and the persistent pool kernel
+(`include/graph/detail/scheduler.hpp`) are implemented: ingestion, claim,
+dispatch, and drain run in one launch. Pending: the CUDA pool cases above; the
 particle-feedback example target (`examples/particle_feedback/CMakeLists.txt`
 adds no target, so both example gates are `NOT-BUILT`); the end-to-end
 particle pipeline on the pool; and the GitLab CI runners. Details:

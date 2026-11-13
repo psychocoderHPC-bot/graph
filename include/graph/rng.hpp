@@ -47,7 +47,10 @@
  * every bit of `c`; the outer `splitmix64(c) -> h` then maps `c` to a uniform
  * 64-bit output. The composition is a practical bijection on the key tuples
  * that occur (verified: 200k random tuples, 0 collisions), and the flag1
- * sequence has no period below 2^20 for the verified seeds and ids.
+ * sequence has no period below 2^20 for the verified seeds and ids; the
+ * period guard in `tests/unit/test_rng.cpp` searches up to 2^20 over 2^21
+ * draws for seeds 42, 7, and 0, ids 1, 2, and 3, and purposes FILTER and
+ * DECISION_A.
  *
  * `draw32()` takes the high 32 bits of the 64-bit hash, so every comparison in
  * the decision path is an integer comparison on the `2^32` scale. No floating

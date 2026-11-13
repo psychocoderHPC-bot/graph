@@ -61,7 +61,13 @@ namespace graph
             return laneIndex() == 0u;
         }
 
-        /** Warp-uniform broadcast from `srcLane` (identity for width one). */
+        /** Warp-uniform broadcast from `srcLane` (identity for width one).
+         *
+         * Scalar overloads. A 64-bit value is exchanged as two 32-bit halves so
+         * the call always maps to a single `shfl.b32` per half; this is
+         * byte-identical to a native 64-bit shuffle on every supported backend
+         * and keeps the scalar contract of this class unchanged.
+         */
         template<typename T>
         ALPAKA_FN_ACC constexpr T broadcast(T const& value, std::uint32_t srcLane = 0u) const noexcept
             requires(std::is_trivially_copyable_v<T>)
@@ -75,7 +81,72 @@ namespace graph
                 auto const width = workerWidth();
                 if(width <= 1u)
                     return value;
-                return alpaka::onAcc::warp::shfl(*m_acc, value, srcLane, width);
+                if constexpr(std::is_integral_v<T> && sizeof(T) == 8u)
+                {
+                    // Shuffle the two halves directly. Calling the three-argument
+                    // overload here would select the word-wise overload with
+                    // T = std::uint32_t, which calls itself for a four-byte word
+                    // (unbounded recursion, device stack overflow).
+                    T const lo = alpaka::onAcc::warp::shfl(*m_acc, static_cast<std::uint32_t>(value), srcLane, width);
+                    T const hi
+                        = alpaka::onAcc::warp::shfl(*m_acc, static_cast<std::uint32_t>(value >> 32u), srcLane, width);
+                    return static_cast<T>(lo | (static_cast<T>(hi) << 32u));
+                }
+                else
+                {
+                    return alpaka::onAcc::warp::shfl(*m_acc, value, srcLane, width);
+                }
+            }
+        }
+
+        /** Warp-uniform broadcast of a trivially copyable multi-field value.
+         *
+         * The value is exchanged word by word through the 32-bit shuffle, so
+         * a caller never has to split a struct by hand. Each word moves as a
+         * 32-bit `shfl.b32` (64-bit words split into two halves), which is the
+         * only form that is portable across backends; a native 64-bit shuffle
+         * is backend-specific and can silently drop a word on a non-CUDA
+         * target. The existing scalar overloads keep their exact semantics.
+         *
+         * This is a data-exchange only. It does not order memory: the caller
+         * still needs the `WarpBarrier` that separates a leader's publication
+         * from the lanes' reads, and a vote is never an ordering primitive.
+         */
+        template<typename T>
+        ALPAKA_FN_ACC constexpr T broadcast(T const& value, std::uint32_t srcLane, std::uint32_t width) const noexcept
+            requires(std::is_trivially_copyable_v<T>)
+        {
+            if constexpr(compileTimeWarpSize == 1u)
+            {
+                return value;
+            }
+            else
+            {
+                auto const actual = width > 0u ? width : workerWidth();
+                if(actual <= 1u)
+                    return value;
+                if constexpr(sizeof(T) <= 4u)
+                {
+                    // A four-byte word is the scalar shuffle case. This must not
+                    // call the three-argument overload again: for T =
+                    // std::uint32_t that overload is this function, so the call
+                    // would recurse without a base case.
+                    return alpaka::onAcc::warp::shfl(
+                        *m_acc,
+                        static_cast<std::uint32_t>(*reinterpret_cast<std::uint32_t const*>(&value)),
+                        srcLane,
+                        actual);
+                }
+                else
+                {
+                    T out{};
+                    std::uint32_t const wordCount = static_cast<std::uint32_t>(sizeof(T) / sizeof(std::uint32_t));
+                    auto const* in = reinterpret_cast<std::uint32_t const*>(&value);
+                    auto* words = reinterpret_cast<std::uint32_t*>(&out);
+                    for(std::uint32_t i = 0u; i < wordCount; ++i)
+                        words[i] = alpaka::onAcc::warp::shfl(*m_acc, in[i], srcLane, actual);
+                    return out;
+                }
             }
         }
 

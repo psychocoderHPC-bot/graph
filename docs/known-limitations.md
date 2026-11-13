@@ -5,13 +5,51 @@ SPDX-License-Identifier: MPL-2.0
 # Known limitations
 Engineering facts about the current tree, each with its evidence and the gate that would close it.
 
-## The persistent kernel's register capture is pending
-`-Xptxas -v` captures the per-thread register count in the translation unit that instantiates the
-kernel (`cmake/GraphRegisters.cmake`), but the probe `cmake/GraphRegisterProbe.cu` instantiates
-`RendezvousKernel`, not the pool kernel. Until the pool capture exists, launch geometry uses either
-the rendezvous capture (20 registers per thread, measured on the A30 in `docs/hal-acceptance.md`) or
-the 128-register fallback, so the grid may be conservative, or over-optimistic if the pool kernel
-uses more registers. `test_residency` measures the rendezvous kernel, not the pool kernel.
+## The register capture cannot see a user binder
+`cmake/GraphRegisterProbe.cu` now instantiates the pool's own persistent entry point
+(`detail::PoolKernel`) as well as `RendezvousKernel`, and `-Xptxas -v` reports the maximum. On the
+A30 `PoolKernel<NullBinder>` compiles to 48 registers/thread (32 blocks/SM, the 1792-worker wave).
+The binder is user code compiled into the same kernel: the test toy binder compiles to 90
+registers/thread (20 blocks/SM, 1120 blocks). The capture therefore cannot bound the wave for an
+arbitrary binder, so `startPool()` keeps the 128-register floor on top of the captured value
+(896 blocks) unless `PoolConfig::registerHint` names a measured binder value. The open item is a
+capture that includes a representative binder, or a per-instantiation occupancy check.
+
+## Shuffle-based broadcast does not reconverge a split warp
+The pinned alpaka implements `alpaka::onAcc::warp::shfl` as
+`__shfl_sync(__activemask(), value, srcLane, width)`. `__activemask()` reports the lanes that are
+converged *at that call site*; it does not reconverge the warp. After a leader-only region that the
+compiler does not bracket with a reconvergence point, the leader and the remaining lanes stay in two
+convergence groups and every later shuffle returns the caller's own value. Measured on the A30 with
+a 32-thread block: immediately after `PacketPool::acquire` (whose leader-only CAS retry loop is the
+trigger) lane 0 reports `__activemask() == 0x1` and lanes 1..31 report `0xfffffffe`; a following
+`shfl` of a leader value delivers nothing to the other lanes, while the same shuffle before the
+`acquire` works. That single defect explained the `imported < accepted` stall, the `errorWord 0x240`
+abort, the all-wrong sink slots, and probe 3.
+
+The pool no longer depends on a shuffle for any decision: the ready-ring claim result, the
+packet-pool claim/release/configure result, and the importer/startup control values travel through
+`graph::WarpHandoff` (one block-shared slot, written by lane 0, followed by `syncBlockThreads`, read
+by every lane). The remaining shuffle users are functors and the chunk-assembly code, which call a
+broadcast only in uniform control flow. The gate for reintroducing shuffles into a leader-then-
+collective path is a broadcast primitive that passes an explicit full mask plus a warp convergence
+point; the pinned alpaka does not provide one.
+
+## The initializer role must stay unique
+The pool used to abort at 256 workers and above (a power-of-two threshold) and at the full 896-block
+wave, with `errorWord 0x240` and sink accounting `correct=0 missing=N`. The initializer role was
+inferred from a block-index comparison, and on the full wave every block evaluated it as "I am the
+initializer", so all of them ran `ReadyRing::initialize()` and `PacketPool::configure()`. A late
+`configure()` rewrites each slot record to its initial free-list value, so a slot handed out by an
+earlier `acquire()` read back as `{next slot, generation 0}` and the executing block dropped the job.
+The wait path was never exercised by those blocks and formed a host-only `steady_clock` deadline in
+device code.
+
+Both are closed: the role is decided from the block index the kernel derives from the accelerator
+and passes by value, the wait path no longer forms a host clock read on the device, and
+`QuiescenceSnapshot::initializerClaims` is asserted to be one on every ladder rung and every point of
+the 128..896 worker sweep. That counter is the regression gate: a second initializer means the pool
+was re-configured underneath live owners.
 
 ## Multi-warp-per-block is refused by design
 `WarpBarrier::barrier()` maps to a block-wide barrier only when the block holds exactly one warp.
@@ -59,6 +97,7 @@ The compute target reports `sharing=unknown`. The overlap and arrival timings in
 evidence, not benchmarks. A benchmark run requires an `exclusive` system.
 
 ## Acceptance gates still pending at this commit
+This section is the record for `52be5c72`; the current branch status is in the two sections above.
 `docs/hal-acceptance.md` covers `52be5c72`; the CPU and CUDA CTest suites pass there (119/119 and
 127/127). The following gates are not claimed:
 - The particle-feedback example and its histogram. The target does not exist;

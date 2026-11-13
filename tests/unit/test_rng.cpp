@@ -189,15 +189,22 @@ TEST_CASE("rng lag-1 autocorrelation of the destroy bit", "[rng]")
     REQUIRE(std::abs(lag1) < 0.05);
 }
 
-TEST_CASE("rng flag1 sequence has no period below 2^16", "[rng]")
+TEST_CASE("rng flag1 sequence has no period below 2^20", "[rng]")
 {
-    // The defect guard: the defective single-mix scheme produces a flag1
-    // sequence with period 256 (draw32(v) == draw32(v+256) for every key),
-    // which makes roughly 1/256 of particles survive indefinitely. The
-    // corrected double-mix scheme must show no period below 2^16 for the
-    // verified seeds and ids, and the defective scheme must reproduce the
-    // period-256 defect so this test cannot pass vacuously.
-    constexpr std::uint64_t sequenceLength = 65536u;
+    // The period guard. The documented single-mix defect gives the flag1
+    // sequence a short period, which makes a fixed fraction of particles
+    // survive indefinitely. The corrected double-mix scheme must show no
+    // period below 2^20 for the verified seeds and ids, which is the claim in
+    // `docs/numerics.md`, `include/graph/rng.hpp`, and
+    // `tests/reference/oracle.hpp`. The single-mix reference is evaluated as
+    // well and printed for context; this tree does not assert its period,
+    // because the inlined reference and the historical period-256 claim do not
+    // agree here.
+    //
+    // A period p is only detectable when the observed sequence is at least
+    // 2*p long, so the sample is 2^21 draws and the search reaches 2^20.
+    constexpr std::uint64_t sequenceLength = 1u << 21u;
+    constexpr std::uint32_t maxPeriod = 1u << 20u;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> const seeds{{42u, 1u}, {7u, 2u}, {0u, 3u}};
     std::vector<std::uint64_t> const purposes{1u, 2u}; // FILTER, DECISION_A
 
@@ -217,19 +224,20 @@ TEST_CASE("rng flag1 sequence has no period below 2^16", "[rng]")
                 defective.push_back(defectiveDraw32(seed, id, visit, purpose) >= (1u << 31u));
             }
 
-            auto const correctedPeriod = findPeriod(corrected, 65536u / 2u);
+            auto const correctedPeriod = findPeriod(corrected, maxPeriod);
             std::printf(
                 "[rng] flag1 period search seed=%llu id=%llu purpose=%llu: corrected=%u defective=%u\n",
                 static_cast<unsigned long long>(seed),
                 static_cast<unsigned long long>(id),
                 static_cast<unsigned long long>(purpose),
                 correctedPeriod,
-                findPeriod(defective, 65536u / 2u));
+                findPeriod(defective, maxPeriod));
 
-            // The corrected scheme must show no period below 2^16.
+            // The corrected scheme must show no period below 2^20.
             // findPeriod returns 0 when no period is found up to maxPeriod;
-            // any positive return value must be >= 2^16.
-            bool const noShortPeriod = (correctedPeriod == 0u) || (correctedPeriod >= (1u << 16u));
+            // any positive return value must be >= 2^20. The sampled length is
+            // 2^21 so a period of up to 2^20 is detectable at all.
+            bool const noShortPeriod = (correctedPeriod == 0u) || (correctedPeriod >= maxPeriod);
             REQUIRE(noShortPeriod);
         }
     }
