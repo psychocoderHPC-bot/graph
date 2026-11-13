@@ -191,7 +191,27 @@ namespace
             if(!result.has_value())
             {
                 pool.abort();
-                auto second = pool.waitFor(std::chrono::seconds{10});
+                auto second = pool.waitFor(std::chrono::seconds{20});
+                if(second.has_value())
+                {
+                    auto const& c = second->counters;
+                    std::printf(
+                        "[assembly] TIMEOUT errorWord=0x%x imported=%llu completed=%llu outstanding=%llu "
+                        "pendingSources=%llu partial=%llu queued=%llu active=%llu publications=%llu "
+                        "drainRounds=%llu stopReason=%u\n",
+                        second->errorWord,
+                        static_cast<unsigned long long>(c.imported),
+                        static_cast<unsigned long long>(c.completedJobs),
+                        static_cast<unsigned long long>(c.outstanding),
+                        static_cast<unsigned long long>(c.pendingSources),
+                        static_cast<unsigned long long>(c.partialBuffers),
+                        static_cast<unsigned long long>(c.queued),
+                        static_cast<unsigned long long>(c.active),
+                        static_cast<unsigned long long>(c.publications),
+                        static_cast<unsigned long long>(c.drainRounds),
+                        c.stopReason);
+                    std::fflush(stdout);
+                }
                 FAIL("assembly pool did not stop within the deadline");
                 return second.has_value() ? *second : graph::PoolResult{};
             }
