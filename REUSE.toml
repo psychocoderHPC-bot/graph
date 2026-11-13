@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 René Widera and contributors
+# SPDX-License-Identifier: MPL-2.0
+#
+# REUSE annotations for files that cannot carry an inline SPDX header.
+# Files copied from alpaka retain their upstream copyright notices.
+
+version = 1
+
+[[annotations]]
+path = [
+  "LICENSE",
+  "REUSE.toml",
+  "include/graph/.gitkeep",
+  "examples/particle_feedback/.gitkeep",
+  "tests/unit/.gitkeep",
+  "tests/integration/.gitkeep",
+  "scripts/.gitkeep",
+]
+SPDX-FileCopyrightText = "2026 René Widera and contributors"
+SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = ".clang-format"
+SPDX-FileCopyrightText = [
+  "2026 René Widera and contributors",
+  "alpaka contributors",
+]
+SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = [
+  "tests/reference/oracle.hpp",
+  "tests/reference/oracle.cpp",
+  "tests/reference/test-vectors.md",
+]
+SPDX-FileCopyrightText = "2025 René Widera"
+SPDX-License-Identifier = "MPL-2.0"

@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 René Widera and contributors
+# SPDX-License-Identifier: MPL-2.0
+
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+install/
+
+# CMake artefacts
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+*.cmake.stamp
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+
+# ccache / compiler caches
+.ccache/
+.cache/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
