@@ -774,6 +774,41 @@ namespace graph
                 snapshot.workerCount = m_geometry.workerCount;
                 snapshot.initializerClaims = state->initializerClaims;
 
+                // Exit-path diagnostics: dump every worker that is not `exiting`
+                // after a stop was requested. This is the snapshot that names the
+                // loop stage of a worker that never left the scheduling loop. The
+                // words are copied from device state; the host ring-header copy
+                // (above) gives the ready-ring lock owner state.
+                if(state->stopReason != 0u)
+                {
+                    std::printf(
+                        "[pool-diag] stopReason=%llu errorWord=0x%x; workers still not exiting:\n",
+                        static_cast<unsigned long long>(state->stopReason),
+                        state->errorWord);
+                    for(std::uint32_t worker = 0u; worker < m_geometry.workerCount; ++worker)
+                    {
+                        std::uint32_t const stage = state->workerStage[worker];
+                        if(stage != static_cast<std::uint32_t>(detail::WorkerStage::exiting))
+                        {
+                            std::uint32_t ringLock = 0u;
+                            if(m_ringHeaderHost && alpaka::onHost::data(*m_ringHeaderHost) != nullptr)
+                            {
+                                ReadyRingLayout const* header
+                                    = reinterpret_cast<ReadyRingLayout const*>(alpaka::onHost::data(*m_ringHeaderHost));
+                                ringLock = header->lock;
+                            }
+                            std::printf(
+                                "[pool-diag]   worker=%u stage=%s iters=%llu last=%s ringLock=%u\n",
+                                static_cast<unsigned>(worker),
+                                detail::toString(static_cast<detail::WorkerStage>(stage)),
+                                static_cast<unsigned long long>(state->workerIterations[worker]),
+                                detail::toString(static_cast<detail::WorkerLastAction>(state->workerLastAction[worker])),
+                                static_cast<unsigned>(ringLock));
+                        }
+                    }
+                    std::fflush(stdout);
+                }
+
                 PoolResult result;
                 result.counters = snapshot;
                 result.errorWord = state->errorWord;

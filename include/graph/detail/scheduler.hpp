@@ -324,6 +324,120 @@ namespace graph
             return next;
         }
 
+        // ------------------------------------------------------------------
+        // Exit-path diagnostics (clearly marked; cheap relaxed stores).
+        //
+        // Every worker warp writes its current loop `stage`, an iteration
+        // counter, and a `last action` word at each loop transition. The host
+        // copies these words back once the kernel has stopped and prints every
+        // worker that is not `exiting`, which names the loop stage of a worker
+        // that never left the scheduling loop after a stop request. The stores
+        // are relaxed: they carry no synchronization meaning for the pool
+        // protocol, and a reader that observes a stage value also observes no
+        // more than the counter values of that same transition.
+        // ------------------------------------------------------------------
+        /** Loop stages of one worker warp, written by the scheduling loop. */
+        enum class WorkerStage : std::uint32_t
+        {
+            idle = 0u,
+            startup = 1u,
+            waitInit = 2u,
+            pollReady = 3u,
+            importerStep = 4u,
+            backoff = 5u,
+            executing = 6u,
+            publishing = 7u,
+            retiring = 8u,
+            waitingLock = 9u,
+            exiting = 10u
+        };
+
+        /** Last successful action of one worker warp, written with the stage. */
+        enum class WorkerLastAction : std::uint32_t
+        {
+            none = 0u,
+            claim = 1u,
+            execute = 2u,
+            publish = 3u,
+            retire = 4u,
+            import = 5u,
+            quiescence = 6u
+        };
+
+        static_assert(std::is_trivially_copyable_v<WorkerStage>);
+        static_assert(std::is_trivially_copyable_v<WorkerLastAction>);
+
+        ALPAKA_FN_HOST_ACC inline char const* toString(WorkerStage stage) noexcept
+        {
+            switch(stage)
+            {
+            case WorkerStage::idle:
+                return "idle";
+            case WorkerStage::startup:
+                return "startup";
+            case WorkerStage::waitInit:
+                return "waitInit";
+            case WorkerStage::pollReady:
+                return "pollReady";
+            case WorkerStage::importerStep:
+                return "importerStep";
+            case WorkerStage::backoff:
+                return "backoff";
+            case WorkerStage::executing:
+                return "executing";
+            case WorkerStage::publishing:
+                return "publishing";
+            case WorkerStage::retiring:
+                return "retiring";
+            case WorkerStage::waitingLock:
+                return "waitingLock";
+            case WorkerStage::exiting:
+                return "exiting";
+            }
+            return "?";
+        }
+
+        ALPAKA_FN_HOST_ACC inline char const* toString(WorkerLastAction action) noexcept
+        {
+            switch(action)
+            {
+            case WorkerLastAction::none:
+                return "none";
+            case WorkerLastAction::claim:
+                return "claim";
+            case WorkerLastAction::execute:
+                return "execute";
+            case WorkerLastAction::publish:
+                return "publish";
+            case WorkerLastAction::retire:
+                return "retire";
+            case WorkerLastAction::import:
+                return "import";
+            case WorkerLastAction::quiescence:
+                return "quiescence";
+            }
+            return "?";
+        }
+
+        /** Record the current loop stage for exit-path diagnostics. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline void recordStage(
+            SchedulerRuntime<T_Acc> const& runtime,
+            std::uint32_t blockIndex,
+            WorkerStage stage,
+            WorkerLastAction action = WorkerLastAction::none) noexcept
+        {
+            if(runtime.warp.isLeader())
+            {
+                auto* state = static_cast<PoolDeviceState*>(runtime.args.state);
+                dev::storeRelease(&state->workerStage[blockIndex], static_cast<std::uint32_t>(stage));
+                dev::storeRelease(
+                    &state->workerIterations[blockIndex],
+                    dev::loadRelaxed(&state->workerIterations[blockIndex]) + std::uint64_t{1u});
+                dev::storeRelease(&state->workerLastAction[blockIndex], static_cast<std::uint32_t>(action));
+            }
+        }
+
         /** True when the mapped host abort word is set. */
         template<typename T_Acc>
         ALPAKA_FN_ACC inline bool hostAbortRequested(SchedulerRuntime<T_Acc> const& runtime) noexcept
@@ -1555,8 +1669,10 @@ namespace graph
             std::uint64_t idleIterations = 0u;
             while(true)
             {
+                recordStage(runtime, blockIndex, WorkerStage::pollReady);
                 if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
                 {
+                    recordStage(runtime, blockIndex, WorkerStage::exiting);
                     if(runtime.warp.isLeader())
                         return;
                 }
@@ -1566,6 +1682,7 @@ namespace graph
                 // worker as well, and the read is warp-uniform on every lane.
                 if(hostAbortRequested(runtime))
                 {
+                    recordStage(runtime, blockIndex, WorkerStage::exiting);
                     if(runtime.warp.isLeader())
                     {
                         recordError(runtime, PoolError::aborted);
@@ -1577,9 +1694,13 @@ namespace graph
                 bool didWork = false;
                 if(blockIndex == 0u)
                 {
+                    recordStage(runtime, blockIndex, WorkerStage::importerStep);
                     importerStep(runtime);
                     if(loadDeviceAcquire(runtime.acc, &runtime.state.stopReason) != 0u)
+                    {
+                        recordStage(runtime, blockIndex, WorkerStage::exiting);
                         return;
+                    }
                 }
 
                 JobDescriptor job{};
@@ -1587,6 +1708,7 @@ namespace graph
                 if(status == RingStatus::Accepted)
                 {
                     idleIterations = 0u;
+                    recordStage(runtime, blockIndex, WorkerStage::executing, WorkerLastAction::claim);
                     if(runtime.warp.isLeader())
                     {
                         (void) addDevice(runtime.acc, &runtime.state.active, std::uint64_t{1u});
@@ -1598,6 +1720,11 @@ namespace graph
                     // Order the leader's acquire before any lane reads packet data.
                     runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
                     bool const executed = executeJob(runtime, job, blockIndex);
+                    recordStage(
+                        runtime,
+                        blockIndex,
+                        WorkerStage::publishing,
+                        executed ? WorkerLastAction::execute : WorkerLastAction::none);
                     // Order every lane's stores before the leader publishes or retires.
                     runtime.barrier.barrier(runtime.acc, runtime.blockThreads, runtime.warp);
                     bool published = false;
@@ -1623,13 +1750,21 @@ namespace graph
                 }
                 else if(status == RingStatus::Contended)
                 {
+                    recordStage(runtime, blockIndex, WorkerStage::backoff);
                     devicePause(runtime.args.idleNanosleep);
                 }
                 else
                 {
                     ++idleIterations;
-                    if(idleIterations >= 4u && quiescenceStep(runtime, blockIndex))
-                        return;
+                    if(idleIterations >= 4u)
+                    {
+                        recordStage(runtime, blockIndex, WorkerStage::retiring, WorkerLastAction::quiescence);
+                        if(quiescenceStep(runtime, blockIndex))
+                        {
+                            recordStage(runtime, blockIndex, WorkerStage::exiting);
+                            return;
+                        }
+                    }
                     devicePause(runtime.args.idleNanosleep);
                 }
             }

@@ -408,6 +408,14 @@ namespace graph
             alignas(128) std::uint64_t drainPublications{0u};
             /** Quiescence/drain rounds executed (repeat-detection count). */
             alignas(128) std::uint64_t drainRounds{0u};
+
+            // Exit-path diagnostics (written by every worker warp at loop
+            // transitions with relaxed stores). Read once, on the host, after the
+            // kernel has stopped: they exist to name the loop stage of a worker
+            // that did not leave the scheduling loop after a stop request.
+            alignas(128) std::uint32_t workerStage[poolMaxWorkers]{};
+            alignas(128) std::uint64_t workerIterations[poolMaxWorkers]{};
+            alignas(128) std::uint32_t workerLastAction[poolMaxWorkers]{};
         };
 
         static_assert(std::is_trivially_copyable_v<PoolDeviceState>);
