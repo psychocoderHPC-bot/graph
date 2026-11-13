@@ -56,6 +56,19 @@ Options:
                             (default: 600)
   --cuda-timeout SEC        Per-test ctest timeout for the CUDA suite
                             (default: 900)
+  --repeat N                Repeat every ctest case until a failure or N runs
+                            (default: 3); the executed case count is recorded
+                            as cases x N.
+  --pool-repeat N           Repeat the CUDA ctest cases matching -R pool up to
+                            N times (default: 20), with an overall wall-clock
+                            bound from --pool-repeat-timeout.
+  --pool-repeat-timeout SEC Wall-clock timeout for the pool repeat gate
+                            (default: 3600)
+  --sanitizer-timeout SEC   Wall-clock timeout for each compute-sanitizer group
+                            (default: 600)
+  --sanitize                Run the CUDA memcheck groups (default: on when
+                            compute-sanitizer is on PATH)
+  --no-sanitize             Do not run the CUDA memcheck groups (pending gate)
   --example-timeout SEC     Wall-clock timeout for one example run
                             (default: 300)
   --configure-timeout SEC   Wall-clock timeout for one cmake configure
@@ -79,14 +92,18 @@ Options:
   -h, --help                Show this help
 
 Gates:
-  CPU build/test, CUDA build/test, "no skipped CUDA tests", the example on
-  both backends, scripts/check-format.sh, and scripts/reuse-lint.sh.
+  CPU build/test, CUDA build/test, "no skipped CUDA tests", the CUDA pool
+  repeat, the two compute-sanitizer memcheck groups, the example on both
+  backends, scripts/check-format.sh, and scripts/reuse-lint.sh.
 
-A skipped test on the CUDA configuration fails the run: a skipped hardware
-test is not a pass. A skipped configuration (no nvcc, no NVIDIA device,
---skip-*) is recorded as pending, not failed. A missing example target is
-recorded as NOT-BUILT and does not fail the run; the gate becomes an executed
-pass/fail gate automatically once examples/particle_feedback builds a target.
+Every gate row names the command that produced it and the artifact that holds
+its output. A skipped test on the CUDA configuration fails the run: a skipped
+hardware test is not a pass. A skipped configuration (no nvcc, no NVIDIA
+device, --skip-*) is recorded as pending, not failed. A missing example target
+is recorded as NOT-BUILT and does not fail the run; the gate becomes an
+executed pass/fail gate automatically once examples/particle_feedback builds
+a target. A missing compute-sanitizer is pending and is never recorded as a
+pass. A sanitizer gate passes only when its ERROR SUMMARY reports 0 errors.
 
 Exit status:
   0  every executed gate passed and no gate is pending
@@ -142,6 +159,11 @@ cuda_arch=80
 jobs=""
 cpu_timeout=600
 cuda_timeout=900
+repeat=3
+pool_repeat=20
+pool_repeat_timeout=3600
+sanitizer_timeout=600
+sanitize=auto
 example_timeout=300
 configure_timeout=1800
 build_timeout=3600
@@ -227,6 +249,50 @@ while [ "$#" -gt 0 ]; do
             ;;
         --cuda-timeout=*)
             cuda_timeout=${1#*=}
+            shift
+            ;;
+        --repeat)
+            need_arg "$@"
+            repeat=$2
+            shift 2
+            ;;
+        --repeat=*)
+            repeat=${1#*=}
+            shift
+            ;;
+        --pool-repeat)
+            need_arg "$@"
+            pool_repeat=$2
+            shift 2
+            ;;
+        --pool-repeat=*)
+            pool_repeat=${1#*=}
+            shift
+            ;;
+        --pool-repeat-timeout)
+            need_arg "$@"
+            pool_repeat_timeout=$2
+            shift 2
+            ;;
+        --pool-repeat-timeout=*)
+            pool_repeat_timeout=${1#*=}
+            shift
+            ;;
+        --sanitizer-timeout)
+            need_arg "$@"
+            sanitizer_timeout=$2
+            shift 2
+            ;;
+        --sanitizer-timeout=*)
+            sanitizer_timeout=${1#*=}
+            shift
+            ;;
+        --sanitize)
+            sanitize=on
+            shift
+            ;;
+        --no-sanitize)
+            sanitize=off
             shift
             ;;
         --example-timeout)
@@ -346,6 +412,10 @@ done
 require_uint --cuda-arch "$cuda_arch"
 require_uint --cpu-timeout "$cpu_timeout"
 require_uint --cuda-timeout "$cuda_timeout"
+require_uint --repeat "$repeat"
+require_uint --pool-repeat "$pool_repeat"
+require_uint --pool-repeat-timeout "$pool_repeat_timeout"
+require_uint --sanitizer-timeout "$sanitizer_timeout"
 require_uint --example-timeout "$example_timeout"
 require_uint --configure-timeout "$configure_timeout"
 require_uint --build-timeout "$build_timeout"
@@ -356,6 +426,10 @@ require_uint --seed "$seed"
 [ "$cuda_arch" -gt 0 ] || die "--cuda-arch must be a positive compute capability"
 [ "$cpu_timeout" -gt 0 ] || die "--cpu-timeout must be positive"
 [ "$cuda_timeout" -gt 0 ] || die "--cuda-timeout must be positive"
+[ "$repeat" -gt 0 ] || die "--repeat must be positive"
+[ "$pool_repeat" -gt 0 ] || die "--pool-repeat must be positive"
+[ "$pool_repeat_timeout" -gt 0 ] || die "--pool-repeat-timeout must be positive"
+[ "$sanitizer_timeout" -gt 0 ] || die "--sanitizer-timeout must be positive"
 [ "$example_timeout" -gt 0 ] || die "--example-timeout must be positive"
 [ "$configure_timeout" -gt 0 ] || die "--configure-timeout must be positive"
 [ "$build_timeout" -gt 0 ] || die "--build-timeout must be positive"
@@ -414,6 +488,7 @@ diagnostics="$artifact_dir/diagnostics.md"
 artifacts_list="$artifact_dir/artifacts.md"
 verdict_file="$artifact_dir/verdict.md"
 summary="$artifact_dir/summary.md"
+test_counts="$artifact_dir/test-counts.md"
 
 : > "$results"
 : > "$commands"
@@ -422,19 +497,40 @@ summary="$artifact_dir/summary.md"
 : > "$example_summary"
 : > "$diagnostics"
 : > "$artifacts_list"
+: > "$test_counts"
 
 any_fail=0
 any_pending=0
 
 add_result()
 {
-    printf '%s\t%s\t%s\n' "$1" "$2" "$(printf '%s' "$3" | tr '\n\t' '  ')" >> "$results"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$1" "$2" \
+        "$(printf '%s' "$3" | tr '\n\t' '  ')" \
+        "$(printf '%s' "$4" | tr '\n\t' '  ')" \
+        "$(printf '%s' "$5" | tr '\n\t' '  ')" >>"$results"
 }
 
 log_cmd()
 {
     printf '$ %s\n' "$(printf '%s' "$*" | sed -e "s|$artifact_dir|\$ARTIFACT|g" -e "s|$repo_root|.|g")" >> "$commands"
 }
+
+log_header()
+{
+    header_file=$1
+    header_title=$2
+    {
+        printf '# HAL acceptance log\n'
+        printf '# commit: %s\n' "$git_commit"
+        printf '# artifact: %s\n' "$artifact_dir"
+        printf '# generated: %s\n' "$generated_at"
+        printf '# gate: %s\n' "$header_title"
+        printf '\n'
+    } >"$header_file"
+}
+
+log_header "$commands" "command log"
 
 record()
 {
@@ -459,6 +555,11 @@ record build_type Release
 record build_jobs "$jobs"
 record cpu_timeout_s "$cpu_timeout"
 record cuda_timeout_s "$cuda_timeout"
+record repeat "$repeat"
+record pool_repeat "$pool_repeat"
+record pool_repeat_timeout_s "$pool_repeat_timeout"
+record sanitizer_timeout_s "$sanitizer_timeout"
+record sanitize "$sanitize"
 record example_timeout_s "$example_timeout"
 record configure_timeout_s "$configure_timeout"
 record build_timeout_s "$build_timeout"
@@ -607,14 +708,20 @@ configure_and_build()
     log_cmd timeout "$configure_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
         -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@"
 
+    log_header "$conf_log" "$label configure"
     if timeout "$configure_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
-        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@" >"$conf_log" 2>&1; then
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@" >>"$conf_log" 2>&1; then
         conf_rc=0
     else
         conf_rc=$?
     fi
+    configure_cmd="cmake -S . -B \$ARTIFACT/build-$cfg -G Ninja -DCMAKE_BUILD_TYPE=Release -DGRAPH_ENABLE_CUDA=$cuda_flag"
+    if [ "$cuda_flag" = ON ]; then
+        configure_cmd="$configure_cmd -DCMAKE_CUDA_ARCHITECTURES=$cuda_arch"
+    fi
     if [ "$conf_rc" -ne 0 ]; then
-        add_result "$label build" FAIL "configure failed (rc=$conf_rc); see configure-$cfg.log"
+        add_result "$label build" FAIL "configure failed (rc=$conf_rc)" \
+            "timeout $configure_timeout $configure_cmd" "\$ARTIFACT/configure-$cfg.log"
         any_fail=1
         return 1
     fi
@@ -622,19 +729,23 @@ configure_and_build()
     set -- cmake --build "$build" -j "$jobs"
     log_cmd timeout "$build_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
         -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@"
+    log_header "$build_log" "$label build"
     if timeout "$build_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
-        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@" >"$build_log" 2>&1; then
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH "$@" >>"$build_log" 2>&1; then
         build_rc=0
     else
         build_rc=$?
     fi
+    build_cmd="cmake --build \$ARTIFACT/build-$cfg -j $jobs"
     if [ "$build_rc" -ne 0 ]; then
-        add_result "$label build" FAIL "build failed (rc=$build_rc); see build-$cfg.log"
+        add_result "$label build" FAIL "build failed (rc=$build_rc)" \
+            "timeout $build_timeout $build_cmd" "\$ARTIFACT/build-$cfg.log"
         any_fail=1
         return 1
     fi
 
-    add_result "$label build" PASS "Release, Ninja, -j $jobs"
+    add_result "$label build" PASS "Release, Ninja, -j $jobs" \
+        "$configure_cmd; $build_cmd" "\$ARTIFACT/build-$cfg.log"
     {
         printf '### %s build\n\n' "$label"
         printf -- '- build directory: `$ARTIFACT/build-%s`\n' "$cfg"
@@ -642,6 +753,41 @@ configure_and_build()
         printf -- '- build log: `$ARTIFACT/build-%s.log`\n\n' "$cfg"
     } >>"$details"
     return 0
+}
+
+ctest_list_count()
+{
+    list_cfg=$1
+    list_build=$2
+    list_log="$artifact_dir/ctest-list-$list_cfg.log"
+    set -- ctest --test-dir "$list_build" -N
+    log_cmd "$@"
+    log_header "$list_log" "$list_cfg registered tests"
+    if scrubbed "$@" >>"$list_log" 2>&1; then
+        list_rc=0
+    else
+        list_rc=$?
+    fi
+    list_count=$(sed -n 's/^Total Tests:[[:space:]]*//p' "$list_log" | tail -1)
+    case "$list_count" in
+        '' | *[!0-9]*)
+            if [ "$list_rc" -ne 0 ]; then
+                printf '0\n'
+            else
+                printf '0\n'
+            fi
+            ;;
+        *) printf '%s\n' "$list_count" ;;
+    esac
+}
+
+ctest_runs()
+{
+    runs=$(grep -c 'Test #[0-9][0-9]*:' "$1" 2>/dev/null || true)
+    case "$runs" in
+        '' | *[!0-9]*) runs=0 ;;
+    esac
+    printf '%s\n' "$runs"
 }
 
 run_tests()
@@ -654,28 +800,40 @@ run_tests()
     log="$artifact_dir/ctest-$cfg.log"
 
     rm -f "$junit"
+    registered=$(ctest_list_count "$cfg" "$build")
+    [ -n "$registered" ] || registered=0
+
     if [ "$cfg" = cuda ]; then
         set -- ctest --test-dir "$build" --output-on-failure --output-junit "$junit" \
-            --timeout "$timeout_s" --no-tests=error
+            --timeout "$timeout_s" --repeat until-fail:"$repeat" --no-tests=error
         log_cmd "$@"
-        if scrubbed_cuda "$@" >"$log" 2>&1; then
+        log_header "$log" "$label tests, repeat $repeat"
+        if scrubbed_cuda "$@" >>"$log" 2>&1; then
             rc=0
         else
             rc=$?
         fi
     else
         set -- ctest --test-dir "$build" --output-on-failure --output-junit "$junit" \
-            --timeout "$timeout_s" --no-tests=error
+            --timeout "$timeout_s" --repeat until-fail:"$repeat" --no-tests=error
         log_cmd "$@"
-        if scrubbed "$@" >"$log" 2>&1; then
+        log_header "$log" "$label tests, repeat $repeat"
+        if scrubbed "$@" >>"$log" 2>&1; then
             rc=0
         else
             rc=$?
         fi
     fi
 
+    ctest_cmd="ctest --test-dir \$ARTIFACT/build-$cfg --output-on-failure --output-junit \$ARTIFACT/junit-$cfg.xml --timeout $timeout_s --repeat until-fail:$repeat --no-tests=error"
+
+    executed=$(ctest_runs "$log")
+    [ "$executed" -gt 0 ] || executed=$((registered * repeat))
+
     if [ ! -f "$junit" ]; then
-        add_result "$label tests" FAIL "ctest failed (rc=$rc) and produced no JUnit report"
+        add_result "$label tests" FAIL \
+            "ctest failed (rc=$rc), produced no JUnit report, executed $executed case runs" \
+            "$ctest_cmd" "\$ARTIFACT/ctest-$cfg.log"
         any_fail=1
         return 1
     fi
@@ -692,37 +850,51 @@ run_tests()
     [ -n "$disabled" ] || disabled=0
     passed=$((total - failures - errors - skipped - disabled))
     [ "$passed" -ge 0 ] || passed=0
+    if [ "$registered" -eq 0 ]; then
+        registered=$total
+    fi
 
-    printf 'total=%s\nfailures=%s\nerrors=%s\nskipped=%s\ndisabled=%s\npassed=%s\n' \
-        "$total" "$failures" "$errors" "$skipped" "$disabled" "$passed" \
+    planned=$((registered * repeat))
+    if [ "$executed" -le 0 ]; then
+        executed=$planned
+    fi
+    printf 'registered=%s\nrepeat=%s\nplanned_case_runs=%s\nexecuted_case_runs=%s\nfailures=%s\nerrors=%s\nskipped=%s\ndisabled=%s\npassed_unique=%s\n' \
+        "$registered" "$repeat" "$planned" "$executed" \
+        "$failures" "$errors" "$skipped" "$disabled" "$passed" \
         >"$artifact_dir/counts-$cfg.txt"
 
-    detail="$passed/$total passed, $failures failed, $skipped skipped"
+    detail="$passed/$total passed, $failures failed, $skipped skipped; executed $executed/$planned case runs (cases x repeat)"
     if [ "$rc" -ne 0 ]; then
-        add_result "$label tests" FAIL "ctest rc=$rc: $detail"
+        add_result "$label tests" FAIL "ctest rc=$rc: $detail" \
+            "$ctest_cmd" "\$ARTIFACT/ctest-$cfg.log"
         any_fail=1
     else
-        add_result "$label tests" PASS "$detail"
+        add_result "$label tests" PASS "$detail" \
+            "$ctest_cmd" "\$ARTIFACT/ctest-$cfg.log"
     fi
 
     if [ "$cfg" = cuda ]; then
         skipped_total=$((skipped + disabled))
         if [ "$skipped_total" -gt 0 ]; then
             names=$(list_skipped "$junit")
-            add_result "CUDA skips" FAIL "skipped: ${names:-<unnamed>}"
+            add_result "CUDA skips" FAIL "skipped: ${names:-<unnamed>}" \
+                "$ctest_cmd" "\$ARTIFACT/junit-$cfg.xml"
             any_fail=1
         else
-            add_result "CUDA skips" PASS "none"
+            add_result "CUDA skips" PASS "none in the executed CUDA configuration" \
+                "$ctest_cmd" "\$ARTIFACT/junit-$cfg.xml"
         fi
     fi
 
     {
         printf '### %s tests\n\n' "$label"
         printf '```\n'
-        printf '%s\n' "total=$total failures=$failures errors=$errors skipped=$skipped disabled=$disabled passed=$passed"
+        printf '%s\n' "registered=$registered repeat=$repeat planned_case_runs=$planned executed_case_runs=$executed"
+        printf '%s\n' "unique: passed=$passed failed=$failures errors=$errors skipped=$skipped disabled=$disabled"
         printf '```\n\n'
         printf -- '- ctest log: `$ARTIFACT/ctest-%s.log`\n' "$cfg"
         printf -- '- JUnit report: `$ARTIFACT/junit-%s.xml`\n' "$cfg"
+        printf -- '- registered test list: `$ARTIFACT/ctest-list-%s.log`\n' "$cfg"
         printf -- '- last ctest lines:\n\n```\n'
         tail -n 4 "$log" || true
         printf '```\n\n'
@@ -739,23 +911,27 @@ run_repo_gate()
     gate=$1
     script=$2
     log=$3
+    gate_cmd="timeout $lint_timeout scripts/$script"
     log_cmd timeout "$lint_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
         -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH scripts/"$script"
+    log_header "$log" "$gate"
     if timeout "$lint_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
         -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
-        "$repo_root/scripts/$script" >"$log" 2>&1; then
+        "$repo_root/scripts/$script" >>"$log" 2>&1; then
         rc=0
     else
         rc=$?
     fi
-    detail=$(grep -v '^[[:space:]]*$' "$log" | tail -1 || true)
+    detail=$(grep -v '^[[:space:]]*$' "$log" | grep -v '^# ' | tail -1 || true)
     if [ "$rc" -eq 0 ]; then
-        add_result "$gate" PASS "$detail"
+        add_result "$gate" PASS "$detail" "$gate_cmd" "\$ARTIFACT/$(basename "$log")"
     elif [ "$rc" -eq 127 ]; then
-        add_result "$gate" FAIL "required tool is missing (rc=127): $detail"
+        add_result "$gate" FAIL "required tool is missing (rc=127): $detail" \
+            "$gate_cmd" "\$ARTIFACT/$(basename "$log")"
         any_fail=1
     else
-        add_result "$gate" FAIL "rc=$rc: $detail"
+        add_result "$gate" FAIL "rc=$rc: $detail" \
+            "$gate_cmd" "\$ARTIFACT/$(basename "$log")"
         any_fail=1
     fi
 }
@@ -782,7 +958,10 @@ run_example_config()
         exe=$(find "$build" -type f -name graph_particle_feedback -perm -u+x 2>/dev/null | head -1 || true)
     fi
     if [ -z "$exe" ]; then
-        add_result "Example ($cfg)" NOT-BUILT "target graph_particle_feedback is absent in the $cfg build"
+        add_result "Example ($cfg)" NOT-BUILT \
+            "target graph_particle_feedback is absent in the $cfg build" \
+            "find \$ARTIFACT/build-$cfg -type f -name graph_particle_feedback -perm -u+x" \
+            "\$ARTIFACT/example-summary.md"
         {
             printf '### %s example\n\n' "$cfg"
             printf 'not-built: no `graph_particle_feedback` target exists in the %s build.\n\n' "$cfg"
@@ -819,10 +998,11 @@ run_example_config()
         outlog="$artifact_dir/example-$cfg-$case_name.txt"
         rows="$artifact_dir/example-$cfg-$case_name.rows"
         log_cmd "$@"
+        log_header "$outlog" "example $cfg $case_name"
         if [ "$cfg" = cuda ]; then
             if timeout "$example_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
                 -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
-                CUDA_VISIBLE_DEVICES="$cuda_visible" "$@" >"$outlog" 2>&1; then
+                CUDA_VISIBLE_DEVICES="$cuda_visible" "$@" >>"$outlog" 2>&1; then
                 rc=0
             else
                 rc=$?
@@ -830,7 +1010,7 @@ run_example_config()
         else
             if timeout "$example_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
                 -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
-                "$@" >"$outlog" 2>&1; then
+                "$@" >>"$outlog" 2>&1; then
                 rc=0
             else
                 rc=$?
@@ -877,12 +1057,154 @@ run_example_config()
         } >>"$example_summary"
     done
 
+    example_cmd="graph_particle_feedback --backend $backend (default, zero, chunk100)"
     if [ "$example_failed" -ne 0 ]; then
-        add_result "Example ($cfg)" FAIL "$example_cases cases:$example_detail"
+        add_result "Example ($cfg)" FAIL "$example_cases cases:$example_detail" \
+            "$example_cmd" "\$ARTIFACT/example-$cfg-default.txt"
         any_fail=1
     else
-        add_result "Example ($cfg)" PASS "$example_cases cases:$example_detail"
+        add_result "Example ($cfg)" PASS "$example_cases cases:$example_detail" \
+            "$example_cmd" "\$ARTIFACT/example-$cfg-default.txt"
     fi
+}
+
+find_cuda_test_binary()
+{
+    search_build=$1
+    for candidate in \
+        "$search_build/tests/graph_integration_tests" \
+        "$search_build/bin/graph_integration_tests"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    find "$search_build" -type f -name graph_integration_tests -perm -u+x 2>/dev/null | head -1 || true
+}
+
+run_pool_repeat()
+{
+    repeat_build=$1
+    list_log="$artifact_dir/ctest-list-pool-repeat.log"
+    pool_log="$artifact_dir/pool-repeat.log"
+
+    set -- ctest --test-dir "$repeat_build" -N -R pool
+    log_cmd "$@"
+    log_header "$list_log" "pool repeat registered tests"
+    if scrubbed_cuda "$@" >>"$list_log" 2>&1; then
+        list_rc=0
+    else
+        list_rc=$?
+    fi
+    pool_cases=$(sed -n 's/^Total Tests:[[:space:]]*//p' "$list_log" | tail -1)
+    case "$pool_cases" in
+        '' | *[!0-9]*) pool_cases=0 ;;
+    esac
+
+    pool_repeat_cmd="ctest --test-dir \$ARTIFACT/build-cuda -R pool --output-on-failure --timeout $cuda_timeout --repeat until-fail:$pool_repeat --no-tests=error"
+    if [ "$pool_cases" -eq 0 ]; then
+        add_result "Pool repeat" FAIL "no CUDA test matched -R pool (list rc=$list_rc)" \
+            "timeout $pool_repeat_timeout $pool_repeat_cmd" "\$ARTIFACT/ctest-list-pool-repeat.log"
+        any_fail=1
+        return 1
+    fi
+
+    set -- ctest --test-dir "$repeat_build" -R pool --output-on-failure \
+        --timeout "$cuda_timeout" --repeat until-fail:"$pool_repeat" --no-tests=error
+    log_cmd timeout "$pool_repeat_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
+        CUDA_VISIBLE_DEVICES="$cuda_visible" "$@"
+    log_header "$pool_log" "CUDA pool repeat, $pool_cases cases x $pool_repeat"
+    if timeout "$pool_repeat_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
+        CUDA_VISIBLE_DEVICES="$cuda_visible" "$@" >>"$pool_log" 2>&1; then
+        pool_rc=0
+    else
+        pool_rc=$?
+    fi
+
+    pool_planned=$((pool_cases * pool_repeat))
+    pool_executed=$(ctest_runs "$pool_log")
+    [ "$pool_executed" -gt 0 ] || pool_executed=$pool_planned
+    pool_detail="$pool_executed/$pool_planned case runs ($pool_cases cases x $pool_repeat)"
+    if [ "$pool_rc" -ne 0 ]; then
+        add_result "Pool repeat" FAIL "rc=$pool_rc: $pool_detail" \
+            "timeout $pool_repeat_timeout $pool_repeat_cmd" "\$ARTIFACT/pool-repeat.log"
+        any_fail=1
+        return 1
+    fi
+    add_result "Pool repeat" PASS "$pool_detail" \
+        "timeout $pool_repeat_timeout $pool_repeat_cmd" "\$ARTIFACT/pool-repeat.log"
+    return 0
+}
+
+run_sanitizer_group()
+{
+    san_group=$1
+    san_filter=$2
+    san_expected=$3
+    san_binary=$4
+    san_log="$artifact_dir/sanitizer-memcheck-$san_group.log"
+    san_list_log="$artifact_dir/sanitizer-filter-$san_group-list.log"
+    san_binary_ref=$(printf '%s' "$san_binary" | sed "s|$artifact_dir|\$ARTIFACT|g")
+    san_cmd="timeout $sanitizer_timeout compute-sanitizer --tool memcheck --target-processes all --print-limit 20 $san_binary_ref '$san_filter'"
+
+    if [ -z "$san_binary" ] || [ ! -x "$san_binary" ]; then
+        log_header "$san_log" "compute-sanitizer $san_group"
+        printf 'test binary not found: graph_integration_tests\n' >>"$san_log"
+        add_result "Sanitizer ($san_group)" FAIL "graph_integration_tests is missing from the CUDA build" \
+            "$san_cmd" "\$ARTIFACT/sanitizer-memcheck-$san_group.log"
+        any_fail=1
+        return 1
+    fi
+
+    set -- "$san_binary" --list-tests "$san_filter"
+    log_cmd "$@"
+    log_header "$san_list_log" "Catch2 filter list for $san_group"
+    if scrubbed_cuda "$@" >>"$san_list_log" 2>&1; then
+        list_rc=0
+    else
+        list_rc=$?
+    fi
+    if [ "$list_rc" -ne 0 ] || ! grep -Eq "$san_expected" "$san_list_log"; then
+        log_header "$san_log" "compute-sanitizer $san_group"
+        printf 'Catch2 filter did not list the expected tests: %s\n' "$san_filter" >>"$san_log"
+        add_result "Sanitizer ($san_group)" FAIL "Catch2 filter has no matching test (list rc=$list_rc)" \
+            "graph_integration_tests --list-tests '$san_filter'" "\$ARTIFACT/sanitizer-filter-$san_group-list.log"
+        any_fail=1
+        return 1
+    fi
+
+    set -- compute-sanitizer --tool memcheck --target-processes all --print-limit 20 \
+        "$san_binary" "$san_filter"
+    log_cmd timeout "$sanitizer_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
+        CUDA_VISIBLE_DEVICES="$cuda_visible" "$@"
+    log_header "$san_log" "compute-sanitizer memcheck $san_group"
+    if timeout "$sanitizer_timeout" env -u LD_LIBRARY_PATH -u LIBRARY_PATH \
+        -u CMAKE_PREFIX_PATH -u CPATH -u CPLUS_INCLUDE_PATH \
+        CUDA_VISIBLE_DEVICES="$cuda_visible" "$@" >>"$san_log" 2>&1; then
+        san_rc=0
+    else
+        san_rc=$?
+    fi
+
+    san_summary=$(sed -n 's/.*ERROR SUMMARY:/ERROR SUMMARY:/p' "$san_log" | tail -1)
+    if [ -z "$san_summary" ]; then
+        add_result "Sanitizer ($san_group)" FAIL "no ERROR SUMMARY line (test rc=$san_rc)" \
+            "$san_cmd" "\$ARTIFACT/sanitizer-memcheck-$san_group.log"
+        any_fail=1
+        return 1
+    fi
+    if [ "$san_rc" -ne 0 ] || ! printf '%s\n' "$san_summary" | grep -q 'ERROR SUMMARY: 0 errors'; then
+        add_result "Sanitizer ($san_group)" FAIL "$san_summary (test rc=$san_rc)" \
+            "$san_cmd" "\$ARTIFACT/sanitizer-memcheck-$san_group.log"
+        any_fail=1
+        return 1
+    fi
+    add_result "Sanitizer ($san_group)" PASS "$san_summary (test rc=0)" \
+        "$san_cmd" "\$ARTIFACT/sanitizer-memcheck-$san_group.log"
+    return 0
 }
 
 # ------------------------------------------------------------ execution ---
@@ -890,21 +1212,29 @@ run_example_config()
 printf 'HAL acceptance: repository %s at %s (dirty=%s)\n' "$repo_root" "$git_commit" "$git_dirty"
 printf 'HAL acceptance: artifacts in %s\n' "$artifact_dir"
 
+cpu_test_cmd="ctest --test-dir \$ARTIFACT/build-cpu --output-on-failure --output-junit \$ARTIFACT/junit-cpu.xml --timeout $cpu_timeout --repeat until-fail:$repeat --no-tests=error"
 if [ "$run_cpu" -eq 1 ]; then
     if configure_and_build cpu OFF CPU; then
         run_tests cpu "$artifact_dir/build-cpu" "$cpu_timeout" CPU || true
         run_example_config cpu "$artifact_dir/build-cpu" cpu
     else
-        add_result "CPU tests" FAIL "not run after a CPU build failure"
-        add_result "Example (cpu)" NOT-RUN "not run after a CPU build failure"
+        add_result "CPU tests" FAIL "not run after a CPU build failure" \
+            "$cpu_test_cmd" "\$ARTIFACT/build-cpu.log"
+        add_result "Example (cpu)" NOT-RUN "not run after a CPU build failure" \
+            "graph_particle_feedback --backend cpu" "\$ARTIFACT/example-summary.md"
         any_fail=1
     fi
 else
-    add_result "CPU build" PENDING "skipped by --skip-cpu"
-    add_result "CPU tests" PENDING "skipped by --skip-cpu"
-    add_result "Example (cpu)" PENDING "skipped by --skip-cpu"
+    add_result "CPU build" PENDING "skipped by --skip-cpu" "not run" "-"
+    add_result "CPU tests" PENDING "skipped by --skip-cpu" "not run" "-"
+    add_result "Example (cpu)" PENDING "skipped by --skip-cpu" "not run" "-"
     any_pending=1
 fi
+
+pool_repeat_cmd="ctest --test-dir \$ARTIFACT/build-cuda -R pool --output-on-failure --timeout $cuda_timeout --repeat until-fail:$pool_repeat --no-tests=error"
+cuda_test_cmd="ctest --test-dir \$ARTIFACT/build-cuda --output-on-failure --output-junit \$ARTIFACT/junit-cuda.xml --timeout $cuda_timeout --repeat until-fail:$repeat --no-tests=error"
+san_pool_cmd="compute-sanitizer --tool memcheck --target-processes all --print-limit 20 \$ARTIFACT/build-cuda/tests/graph_integration_tests '[graph][pool][ladder],[graph][pool][probe]'"
+san_chunk_cmd="compute-sanitizer --tool memcheck --target-processes all --print-limit 20 \$ARTIFACT/build-cuda/tests/graph_integration_tests '[chunk_assembly][gpu]'"
 
 if [ "$run_cuda" -eq 1 ]; then
     cuda_reason=""
@@ -915,25 +1245,66 @@ if [ "$run_cuda" -eq 1 ]; then
     fi
 
     if [ -n "$cuda_reason" ]; then
-        add_result "CUDA build" PENDING "not run: $cuda_reason"
-        add_result "CUDA tests" PENDING "not run: $cuda_reason"
-        add_result "CUDA skips" PENDING "not run: $cuda_reason"
-        add_result "Example (cuda)" PENDING "not run: $cuda_reason"
+        add_result "CUDA build" PENDING "not run: $cuda_reason" "not run" "-"
+        add_result "CUDA tests" PENDING "not run: $cuda_reason" "$cuda_test_cmd" "-"
+        add_result "CUDA skips" PENDING "not run: $cuda_reason" "$cuda_test_cmd" "-"
+        add_result "Pool repeat" PENDING "not run: $cuda_reason" \
+            "timeout $pool_repeat_timeout $pool_repeat_cmd" "-"
+        add_result "Sanitizer (pool-ladder-probe)" PENDING "not run: $cuda_reason" "$san_pool_cmd" "-"
+        add_result "Sanitizer (chunk-publication)" PENDING "not run: $cuda_reason" "$san_chunk_cmd" "-"
+        add_result "Example (cuda)" PENDING "not run: $cuda_reason" "not run" "-"
         any_pending=1
     elif configure_and_build cuda ON CUDA; then
         run_tests cuda "$artifact_dir/build-cuda" "$cuda_timeout" CUDA || true
         run_example_config cuda "$artifact_dir/build-cuda" cuda
+        run_pool_repeat "$artifact_dir/build-cuda" || true
+
+        cuda_test_binary=$(find_cuda_test_binary "$artifact_dir/build-cuda")
+        if [ "$sanitize" = off ]; then
+            add_result "Sanitizer (pool-ladder-probe)" PENDING "disabled by --no-sanitize" \
+                "$san_pool_cmd" "-"
+            add_result "Sanitizer (chunk-publication)" PENDING "disabled by --no-sanitize" \
+                "$san_chunk_cmd" "-"
+            any_pending=1
+        elif ! have compute-sanitizer; then
+            add_result "Sanitizer (pool-ladder-probe)" PENDING "compute-sanitizer is not on PATH" \
+                "$san_pool_cmd" "-"
+            add_result "Sanitizer (chunk-publication)" PENDING "compute-sanitizer is not on PATH" \
+                "$san_chunk_cmd" "-"
+            any_pending=1
+        else
+            run_sanitizer_group pool-ladder-probe \
+                '[graph][pool][ladder],[graph][pool][probe]' \
+                'pool gpu correctness ladder|probe 1: warp broadcast' \
+                "$cuda_test_binary" || true
+            run_sanitizer_group chunk-publication \
+                '[chunk_assembly][gpu]' \
+                'chunk_assembly publication guard' \
+                "$cuda_test_binary" || true
+        fi
     else
-        add_result "CUDA tests" FAIL "not run after a CUDA build failure"
-        add_result "CUDA skips" FAIL "not run after a CUDA build failure"
-        add_result "Example (cuda)" NOT-RUN "not run after a CUDA build failure"
+        add_result "CUDA tests" FAIL "not run after a CUDA build failure" \
+            "$cuda_test_cmd" "\$ARTIFACT/build-cuda.log"
+        add_result "CUDA skips" FAIL "not run after a CUDA build failure" \
+            "$cuda_test_cmd" "\$ARTIFACT/build-cuda.log"
+        add_result "Pool repeat" FAIL "not run after a CUDA build failure" \
+            "timeout $pool_repeat_timeout $pool_repeat_cmd" "\$ARTIFACT/build-cuda.log"
+        add_result "Sanitizer (pool-ladder-probe)" FAIL "not run after a CUDA build failure" \
+            "$san_pool_cmd" "\$ARTIFACT/build-cuda.log"
+        add_result "Sanitizer (chunk-publication)" FAIL "not run after a CUDA build failure" \
+            "$san_chunk_cmd" "\$ARTIFACT/build-cuda.log"
+        add_result "Example (cuda)" NOT-RUN "not run after a CUDA build failure" \
+            "graph_particle_feedback --backend cuda" "\$ARTIFACT/example-summary.md"
         any_fail=1
     fi
 else
-    add_result "CUDA build" PENDING "skipped by --skip-cuda"
-    add_result "CUDA tests" PENDING "skipped by --skip-cuda"
-    add_result "CUDA skips" PENDING "skipped by --skip-cuda"
-    add_result "Example (cuda)" PENDING "skipped by --skip-cuda"
+    add_result "CUDA build" PENDING "skipped by --skip-cuda" "not run" "-"
+    add_result "CUDA tests" PENDING "skipped by --skip-cuda" "not run" "-"
+    add_result "CUDA skips" PENDING "skipped by --skip-cuda" "not run" "-"
+    add_result "Pool repeat" PENDING "skipped by --skip-cuda" "not run" "-"
+    add_result "Sanitizer (pool-ladder-probe)" PENDING "skipped by --skip-cuda" "not run" "-"
+    add_result "Sanitizer (chunk-publication)" PENDING "skipped by --skip-cuda" "not run" "-"
+    add_result "Example (cuda)" PENDING "skipped by --skip-cuda" "not run" "-"
     any_pending=1
 fi
 
@@ -972,6 +1343,21 @@ if [ ! -s "$example_summary" ]; then
     printf 'No example run was executed.\n' >>"$example_summary"
 fi
 
+{
+    printf '| Configuration | Registered cases | Repeat | Planned case runs | Executed case runs |\n'
+    printf '| --- | --- | --- | --- | --- |\n'
+    for count_cfg in cpu cuda; do
+        count_file="$artifact_dir/counts-$count_cfg.txt"
+        [ -f "$count_file" ] || continue
+        count_registered=$(sed -n 's/^registered=//p' "$count_file")
+        count_repeat=$(sed -n 's/^repeat=//p' "$count_file")
+        count_planned=$(sed -n 's/^planned_case_runs=//p' "$count_file")
+        count_executed=$(sed -n 's/^executed_case_runs=//p' "$count_file")
+        printf '| %s | %s | %s | %s | %s |\n' \
+            "$count_cfg" "$count_registered" "$count_repeat" "$count_planned" "$count_executed"
+    done
+} >"$test_counts"
+
 # ------------------------------------------------------------- verdict ---
 
 if [ "$any_fail" -ne 0 ]; then
@@ -996,7 +1382,13 @@ if [ "$allow_pending" -eq 1 ] && [ "$status" -eq 2 ]; then
     status=0
 fi
 
-add_result Overall "$overall" "$verdict_text"
+harness_cmd="scripts/hal-acceptance.sh --artifact-dir \$ARTIFACT --repeat $repeat --pool-repeat $pool_repeat"
+if [ "$sanitize" = off ]; then
+    harness_cmd="$harness_cmd --no-sanitize"
+else
+    harness_cmd="$harness_cmd --sanitize"
+fi
+add_result Overall "$overall" "$verdict_text" "$harness_cmd" "\$ARTIFACT/hal-acceptance.md"
 {
     printf '%s\n' "$verdict_text"
     printf '\nCode commit: `%s` (dirty: %s). Environment: `environment.txt` in the artifact directory.\n' \
@@ -1006,10 +1398,14 @@ add_result Overall "$overall" "$verdict_text"
 
 tab=$(printf '\t')
 {
-    printf '| Gate | Result | Evidence |\n'
-    printf '| --- | --- | --- |\n'
-    while IFS="$tab" read -r gate result detail; do
-        printf '| %s | %s | %s |\n' "$gate" "$result" "$(printf '%s' "$detail" | sed 's/|/\\|/g')"
+    printf '| Gate | Result | Detail | Command | Artifact |\n'
+    printf '| --- | --- | --- | --- | --- |\n'
+    while IFS="$tab" read -r gate result detail command artifact; do
+        printf '| %s | %s | %s | %s | %s |\n' \
+            "$gate" "$result" \
+            "$(printf '%s' "$detail" | sed 's/|/\\|/g')" \
+            "$(printf '%s' "$command" | sed 's/|/\\|/g')" \
+            "$artifact"
     done <"$results"
 } >"$summary"
 
@@ -1034,6 +1430,11 @@ tab=$(printf '\t')
     printf -- '- Per-config counts: `$ARTIFACT/counts-<cfg>.txt`\n'
     printf -- '- JUnit reports: `$ARTIFACT/junit-<cfg>.xml`\n'
     printf -- '- CTest logs: `$ARTIFACT/ctest-<cfg>.log`\n'
+    printf -- '- Registered test lists: `$ARTIFACT/ctest-list-<cfg>.log`\n'
+    printf -- '- Test counts: `$ARTIFACT/test-counts.md`\n'
+    printf -- '- Pool repeat log: `$ARTIFACT/pool-repeat.log`\n'
+    printf -- '- Sanitizer logs: `$ARTIFACT/sanitizer-memcheck-<group>.log`\n'
+    printf -- '- Sanitizer filter lists: `$ARTIFACT/sanitizer-filter-<group>-list.log`\n'
     printf -- '- Example outputs: `$ARTIFACT/example-<cfg>-<case>.txt`\n'
     printf -- '- Environment: `$ARTIFACT/environment.txt`\n'
 } >"$artifacts_list"
@@ -1046,6 +1447,7 @@ awk \
     -v f_commands="$commands" \
     -v f_details="$details" \
     -v f_example="$example_summary" \
+    -v f_counts="$test_counts" \
     -v f_diag="$diagnostics" \
     -v f_artifacts="$artifacts_list" \
     -v f_verdict="$verdict_file" \
@@ -1061,6 +1463,7 @@ awk \
     /^\{\{COMMANDS\}\}$/ { emit(f_commands); next }
     /^\{\{DETAILS\}\}$/ { emit(f_details); next }
     /^\{\{EXAMPLE\}\}$/ { emit(f_example); next }
+    /^\{\{TEST_COUNTS\}\}$/ { emit(f_counts); next }
     /^\{\{DIAGNOSTICS\}\}$/ { emit(f_diag); next }
     /^\{\{ARTIFACTS\}\}$/ { emit(f_artifacts); next }
     { print }

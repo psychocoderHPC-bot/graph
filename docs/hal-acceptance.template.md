@@ -29,10 +29,20 @@ Generated at:
 
 {{SUMMARY_TABLE}}
 
-`PASS` means the gate ran and succeeded. `FAIL` means the gate ran and failed.
-`PENDING` means the gate did not run for an environmental reason or was
-skipped. `NOT-BUILT` means the example target does not exist yet and the gate
-is not claimed as verified.
+Each row names the command that produced the result and the artifact that holds
+its output. `$ARTIFACT` is the artifact directory of this run, so every `PASS`
+is traceable to a file. `PASS` means the gate ran and succeeded. `FAIL` means
+the gate ran and failed. `PENDING` means the gate did not run for an
+environmental reason or was skipped. `NOT-BUILT` means the example target does
+not exist yet and the gate is not claimed as verified.
+
+## Test counts
+
+Every `ctest` invocation uses `--repeat until-fail:N`. The executed count is
+parsed from CTest's per-run lines; it equals registered cases x N only when
+every repeat completed. The repeat stops at the first failure of a case.
+
+{{TEST_COUNTS}}
 
 ## Commands
 
