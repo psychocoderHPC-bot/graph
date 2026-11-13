@@ -41,7 +41,21 @@
  * - Iterate over the logical element count (for example
  *   `lane, lane + width, ... < count`) and use `WarpGroup` for ballots,
  *   broadcasts, and ranks.
+ * - Report how many elements it wrote to each output port exactly once with
+ *   `accessor.setOutputCount(port, k)`. The count is warp-uniform: every lane
+ *   passes the same value (a lane-local count is reduced with a ballot or a
+ *   broadcast before the call). A count above the port's capacity is rejected
+ *   by `setOutputCount` and leaves the previous count unchanged.
  * - Use per-lane local state and warp-local exchanges.
+ *
+ * # Output counts
+ *
+ * A port whose functor never calls `setOutputCount` has count zero and appends
+ * nothing to its destination stream. `setOutput` resets the count of that port
+ * to zero, so binding a port always starts from a clean state. A functor must
+ * not rely on a default other than zero: the scheduler publishes exactly what
+ * the functor reported and rejects a port that carries a nonzero count while
+ * the accessor has no output storage for it.
  *
  * # What a functor must not do
  *
@@ -92,6 +106,14 @@ namespace graph
         PacketRecord const* outputRecords[maxPacketPorts]{};
         void* outputData[maxPacketPorts]{};
         std::uint32_t outputPortCount{0u};
+        /**
+         * Number of elements the functor wrote per output port.
+         *
+         * `mutable` so the funnel ABI can keep `PacketAccessor const&` while a
+         * functor reports its counts. The default is zero for every port; see
+         * the file comment for the lifetime rule.
+         */
+        mutable std::uint32_t outputCounts[maxPacketPorts]{};
 
         /** Attach an input port. Returns false when `port` is out of range. */
         ALPAKA_FN_HOST_ACC constexpr bool setInput(std::uint32_t port, PacketRecord const* record, void* data) noexcept
@@ -115,9 +137,33 @@ namespace graph
                 return false;
             outputRecords[port] = record;
             outputData[port] = data;
+            outputCounts[port] = 0u;
             if(port >= outputPortCount)
                 outputPortCount = port + 1u;
             return true;
+        }
+
+        /**
+         * Report the number of elements written to `port`.
+         *
+         * Returns `false` when the port is out of range, has no output record,
+         * or `count` exceeds that record's `capacity`. On failure the previous
+         * count is unchanged, so a functor can surface the rejection.
+         */
+        ALPAKA_FN_HOST_ACC constexpr bool setOutputCount(std::uint32_t port, std::uint32_t count) const noexcept
+        {
+            if(port >= maxPacketPorts || outputRecords[port] == nullptr)
+                return false;
+            if(count > outputRecords[port]->capacity)
+                return false;
+            outputCounts[port] = count;
+            return true;
+        }
+
+        /** Reported output count of `port`; zero for a missing or unbound port. */
+        ALPAKA_FN_HOST_ACC constexpr std::uint32_t outputCount(std::uint32_t port) const noexcept
+        {
+            return port < maxPacketPorts ? outputCounts[port] : 0u;
         }
 
         /** Drop all port bindings. */
@@ -129,6 +175,7 @@ namespace graph
                 inputData[port] = nullptr;
                 outputRecords[port] = nullptr;
                 outputData[port] = nullptr;
+                outputCounts[port] = 0u;
             }
             inputPortCount = 0u;
             outputPortCount = 0u;

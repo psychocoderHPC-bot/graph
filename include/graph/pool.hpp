@@ -334,6 +334,7 @@ namespace graph
             using StagingBuffer = decltype(alpaka::onHost::alloc<JobDescriptor>(
                 std::declval<Device>(),
                 static_cast<std::uint32_t>(poolStagingCapacity)));
+            using AssemblyState = AssemblyStream<std::uint8_t>;
 
             PersistentPoolBackend(
                 Device device,
@@ -350,6 +351,22 @@ namespace graph
                 , m_queue(m_device.makeQueue())
             {
                 static_cast<void>(m_binder);
+                // Every compiled stream is assembled by the scheduler. The
+                // pool has one element schema, so all streams must share the
+                // configured chunk capacity; the assembler arena is one
+                // contiguous byte area with that logical capacity per chunk.
+                for(std::uint32_t index = 0u; index < m_graph.streamCount; ++index)
+                {
+                    if(m_graph.streams[index].chunkCapacity != m_config.chunkCapacity)
+                        throw std::invalid_argument(
+                            "graph::startPool: compiled stream " + std::to_string(index)
+                            + " has a chunk capacity different from the pool configuration");
+                }
+                if(m_config.budget.assemblyStreams == 0u)
+                    m_config.budget.assemblyStreams = m_graph.streamCount;
+                else if(m_config.budget.assemblyStreams < m_graph.streamCount)
+                    throw std::invalid_argument(
+                        "graph::startPool: the packet budget reserves fewer assembly streams than the graph has");
                 // The build-time capture now measures the pool's own persistent
                 // kernel (`cmake/GraphRegisterProbe.cu` instantiates
                 // `detail::PoolKernel` with the default `NullBinder`), so a
@@ -403,6 +420,9 @@ namespace graph
                 m_hostGraph.emplace(alpaka::onHost::allocHost<CompiledGraph>(1u));
                 m_staging.emplace(
                     alpaka::onHost::alloc<JobDescriptor>(m_device, static_cast<std::uint32_t>(poolStagingCapacity)));
+                std::size_t const assemblyBytes
+                    = std::max<std::size_t>(1u, m_graph.streamCount) * sizeof(AssemblyState);
+                m_assemblyStorage.emplace(alpaka::onHost::alloc<std::uint8_t>(m_device, assemblyBytes));
                 m_deviceState.emplace(alpaka::onHost::alloc<PoolDeviceState>(m_device, 1u));
                 m_hostState.emplace(alpaka::onHost::allocHost<PoolDeviceState>(1u));
                 m_hostControl.emplace(alpaka::onHost::allocMapped<PoolHostControl>(m_device, 1u));
@@ -628,6 +648,21 @@ namespace graph
                 auto* hostGraph = alpaka::onHost::data(*m_hostGraph);
                 *hostGraph = m_graph;
                 alpaka::onHost::memcpy(m_queue, *m_graphBuffer, *m_hostGraph);
+
+                std::size_t const assemblyBytes
+                    = std::max<std::size_t>(1u, m_graph.streamCount) * sizeof(AssemblyState);
+                auto hostAssembly = alpaka::onHost::allocHost<std::uint8_t>(assemblyBytes);
+                std::memset(alpaka::onHost::data(hostAssembly), 0, assemblyBytes);
+                // Zeroed storage has StreamId value 0, which is a legal stream
+                // id. Mark every slot explicitly as uninitialized so the
+                // assembler's `initialize()` accepts it exactly once.
+                for(std::uint32_t index = 0u; index < m_graph.streamCount; ++index)
+                {
+                    auto* state = reinterpret_cast<AssemblyState*>(
+                        alpaka::onHost::data(hostAssembly) + static_cast<std::size_t>(index) * sizeof(AssemblyState));
+                    state->id = StreamId::invalid();
+                }
+                alpaka::onHost::memcpy(m_queue, *m_assemblyStorage, hostAssembly);
                 alpaka::onHost::wait(m_queue);
             }
 
@@ -659,6 +694,9 @@ namespace graph
                 args.packetSchema = m_config.packetSchema;
                 args.budget = m_config.budget;
                 args.controlBlock = m_config.controlBlock;
+                args.assemblyStorage = alpaka::onHost::data(*m_assemblyStorage);
+                args.assemblyStreamCount = m_graph.streamCount;
+                args.assemblySlotCount = static_cast<std::uint32_t>(poolPacketSlotCapacity);
 
                 auto const threadSpec
                     = alpaka::onHost::ThreadSpec{m_geometry.blocks, m_geometry.threadsPerBlock, m_executor};
@@ -709,6 +747,10 @@ namespace graph
                 snapshot.distinctWorkers = distinctWorkers;
                 snapshot.launchCount = state->launchCount;
                 snapshot.retiredPackets = state->retiredPackets;
+                snapshot.slotsReturned = state->slotsReturned;
+                snapshot.drainPublications = state->drainPublications;
+                snapshot.drainRounds = state->drainRounds;
+                snapshot.peakHeldSlots = state->peakHeldSlots;
                 snapshot.importPolls = state->debugPolls;
                 snapshot.importBlockedPolls = state->debugImportBlocked;
                 snapshot.importEmptyPolls = state->debugImportEmpty;
@@ -736,7 +778,7 @@ namespace graph
                 result.counters = snapshot;
                 result.errorWord = state->errorWord;
                 if(state->stopReason == poolStoppingDrained && snapshot.outstanding == 0u
-                   && snapshot.pendingSources == 0u)
+                   && snapshot.pendingSources == 0u && snapshot.partialBuffers == 0u)
                 {
                     result.reason = PoolStopReason::stoppedByDrain;
                 }
@@ -770,6 +812,7 @@ namespace graph
             std::optional<IngressRing<JobDescriptor, poolIngressCapacity>> m_ingress;
             std::optional<ByteBuffer> m_readyStorage;
             std::optional<ByteBuffer> m_packetStorage;
+            std::optional<ByteBuffer> m_assemblyStorage;
             std::optional<TableBuffer> m_table;
             std::optional<HostTableBuffer> m_hostTable;
             std::optional<GraphBuffer> m_graphBuffer;
