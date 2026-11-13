@@ -5,7 +5,6 @@
 
 #include <alpaka/alpaka.hpp>
 
-#include <graph/chunk_assembly.hpp>
 #include <graph/detail/job.hpp>
 #include <graph/detail/operation.hpp>
 #include <graph/detail/packet.hpp>
@@ -13,6 +12,7 @@
 #include <graph/detail/warp_group.hpp>
 #include <graph/rng.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -56,16 +56,16 @@
  *   by a host worklist, and executed by all lanes of a device warp.
  * - `operator()` is the project `OperationFn` ABI: `void(T_Acc const&,
  *   JobDescriptor const&, PacketAccessor const&)`. It reads its input packet
- *   span, calls `apply()` per logical element, writes its output through
- *   `StreamAssembler` (reserve, write pointers, commit), and retires the input
- *   exactly once after the commit.
+ *   span, calls `apply()` per logical element, writes into its output spans,
+ *   and reports one warp-uniform element count per port through
+ *   `accessor.setOutputCount()`. The scheduler owns the destination stream:
+ *   it reserves the logical range, copies the reported elements, rotates the
+ *   A/B chunks, publishes full chunks, and retires the input exactly once.
  *
- *   Two additional plain parameters follow the ABI parameters: the
- *   `StreamAssembler<Particle>` view of the destination streams and a `bool*`
- *   error out-parameter the worker forwards to the scheduler. Binding those
- *   per call is the job of the pool's registration wrapper (a later
- *   milestone); a functor that needs state beyond the ABI takes it that way
- *   instead of hiding it in globals.
+ *   The reserved accessor port carries the shared `ResultBlock` (per-id final
+ *   weights, duplicate-sink detector, and error word). It is the same
+ *   non-stream channel the toy fixture uses, so no register is hidden in a
+ *   global and the same functor bodies compile on the CPU and CUDA backends.
  *
  * # Semantics (integers on the 2^32 scale, see `graph/rng.hpp`)
  *
@@ -119,6 +119,51 @@ namespace graph
             bool error{false};
         };
 
+        /** Error bits published into `ResultBlock::errorWord`. */
+        inline constexpr std::uint32_t errorNone = 0u;
+        inline constexpr std::uint32_t errorIdOutOfRange = 1u << 0u;
+        inline constexpr std::uint32_t errorDuplicateSink = 1u << 1u;
+        inline constexpr std::uint32_t errorWeightOverflow = 1u << 2u;
+        inline constexpr std::uint32_t errorOutputOverflow = 1u << 3u;
+
+        /** Shared result sink and error channel of the particle run.
+         *
+         * The pool passes this block through the reserved accessor port (the
+         * same non-stream channel the toy fixture uses). Only `DestroyParticles`
+         * writes the per-id weight slots; every functor may publish an error
+         * bit. Slots are indexed by the source id, so the host compares one
+         * final weight per generated particle.
+         */
+        struct ResultBlock
+        {
+            std::int64_t* weights{nullptr};
+            std::uint32_t* sinkWrites{nullptr};
+            std::uint32_t slotCount{0u};
+            std::uint32_t sinkWriteCount{0u};
+            std::uint32_t errorWord{0u};
+            std::uint32_t reserved{0u};
+        };
+
+        static_assert(std::is_trivially_copyable_v<ResultBlock>);
+        static_assert(std::is_standard_layout_v<ResultBlock>);
+
+        ALPAKA_FN_HOST_ACC constexpr ResultBlock* resultBlock(PacketAccessor const& accessor) noexcept
+        {
+            return static_cast<ResultBlock*>(accessor.inputData[maxPacketPorts - 1u]);
+        }
+
+        template<typename T_Acc>
+        ALPAKA_FN_ACC inline void publishError(
+            T_Acc const& acc,
+            ResultBlock* control,
+            std::uint32_t flags,
+            bool leader) noexcept
+        {
+            if(control == nullptr || flags == 0u || !leader)
+                return;
+            (void) alpaka::onAcc::atomicOr(acc, &control->errorWord, flags, alpaka::onAcc::scope::device);
+        }
+
         /** Checked weight increment: reports overflow instead of wrapping. */
         ALPAKA_FN_HOST_ACC constexpr bool checkedWeightAdd(std::uint32_t& weight, std::uint32_t add) noexcept
         {
@@ -129,28 +174,6 @@ namespace graph
             return true;
         }
 
-        /** Stream ids of the example. Mirrors `StreamIds` of
-         *  `graph/particle_feedback_graph.hpp` as plain values so this header
-         *  stays self-contained. */
-        ALPAKA_FN_HOST_ACC constexpr StreamId streamFilterInput() noexcept
-        {
-            return StreamId{1u};
-        }
-
-        ALPAKA_FN_HOST_ACC constexpr StreamId streamBin0() noexcept
-        {
-            return StreamId{2u};
-        }
-
-        ALPAKA_FN_HOST_ACC constexpr StreamId streamBin1() noexcept
-        {
-            return StreamId{3u};
-        }
-
-        ALPAKA_FN_HOST_ACC constexpr StreamId streamSink() noexcept
-        {
-            return StreamId{4u};
-        }
     } // namespace particle_feedback
 
     /** Source node: assigns id, property, and the initial weight 0. */
@@ -171,60 +194,27 @@ namespace graph
          * `i < request.count`. Output ports: 0 = filter input.
          */
         template<typename T_Acc>
-        ALPAKA_FN_ACC void operator()(
-            T_Acc const& acc,
-            JobDescriptor const& job,
-            PacketAccessor const& accessor,
-            StreamAssembler<Particle> const& assembler,
-            bool* error) const noexcept
+        ALPAKA_FN_ACC void operator()(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+            const noexcept
         {
-            (void) acc;
             WarpGroup<T_Acc> warp{acc};
             auto const lane = warp.laneIndex();
             auto const width = warp.workerWidth();
-            auto const count = job.request.count;
-            auto const seed = job.request.seed;
-            auto const firstId = job.request.firstId;
+            auto const output = accessor.outputSpan<Particle>(job.routing.outputPort);
+            std::uint32_t const count = job.request.count < output.size()
+                                            ? static_cast<std::uint32_t>(job.request.count)
+                                            : static_cast<std::uint32_t>(output.size());
+            for(std::uint32_t i = lane; i < count; i += width)
+                output.write(i, apply(job.request.seed, job.request.firstId + i));
+            (void) accessor.setOutputCount(job.routing.outputPort, count);
+        }
 
-            bool ok = count != 0u;
-            if(ok)
-            {
-                AppendRequest const request
-                    = AppendRequest{particle_feedback::streamFilterInput(), static_cast<std::uint32_t>(count)};
-                StreamReservation<Particle> reservation{};
-                auto const status = reservation.tryReserve(
-                    acc,
-                    warp,
-                    warp.broadcast(static_cast<std::uint32_t>(count) + 1u),
-                    assembler,
-                    &request,
-                    1u,
-                    nullptr,
-                    0u,
-                    nullptr,
-                    0u);
-                ok = status == AppendStatus::Ok;
-                if(ok)
-                {
-                    for(std::uint64_t i = lane; i < count; i += width)
-                    {
-                        auto const target = reservation.writePointer(0u, static_cast<std::uint32_t>(i));
-                        if(target == nullptr)
-                        {
-                            ok = false;
-                            break;
-                        }
-                        *target = apply(seed, firstId + i);
-                    }
-                    ok = ok && reservation.commit(acc, warp);
-                    if(ok)
-                        reservation.retireInput(warp);
-                    else
-                        reservation.cancel(acc, warp);
-                }
-            }
-            if(!ok && error != nullptr && warp.isLeader())
-                *error = true;
+        /** Static `OperationFn` entry point: the pool registers a plain
+         *  function pointer, not a pointer to a member template. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC static void operation(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+        {
+            GenerateParticles{}(acc, job, accessor);
         }
     };
 
@@ -246,91 +236,67 @@ namespace graph
         }
 
         template<typename T_Acc>
-        ALPAKA_FN_ACC void operator()(
-            T_Acc const& acc,
-            JobDescriptor const& job,
-            PacketAccessor const& accessor,
-            StreamAssembler<Particle> const& assembler,
-            bool* error) const noexcept
+        ALPAKA_FN_ACC void operator()(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+            const noexcept
         {
-            (void) acc;
             WarpGroup<T_Acc> warp{acc};
             auto const lane = warp.laneIndex();
             auto const width = warp.workerWidth();
             auto const seed = job.request.seed;
-
             auto const input = accessor.inputSpan<Particle const>(job.routing.inputPort);
-            auto const count = input.size();
+            std::uint32_t const count = static_cast<std::uint32_t>(input.size());
+            std::uint32_t const bin0Port = job.routing.outputPort;
+            std::uint32_t const bin1Port
+                = job.routing.outputPortCount >= 2u ? job.routing.outputPort + 1u : job.routing.outputPort;
+            auto const bin0 = accessor.outputSpan<Particle>(bin0Port);
+            auto const bin1 = accessor.outputSpan<Particle>(bin1Port);
+            auto* control = particle_feedback::resultBlock(accessor);
 
-            // Pass 1: every lane decides its disjoint slice; the reservation
-            // needs the warp-uniform per-destination total.
-            std::uint32_t count0 = 0u;
-            std::uint32_t count1 = 0u;
-            bool ok = true;
-            for(std::size_t i = lane; i < count; ++i)
+            std::uint32_t base0 = 0u;
+            std::uint32_t base1 = 0u;
+            std::uint32_t errors = particle_feedback::errorNone;
+            for(std::uint32_t base = 0u; base < count; base += width)
             {
-                auto const result = apply(seed, input.read(i));
-                if(static_cast<std::uint32_t>(result.destination)
-                   == static_cast<std::uint32_t>(particle_feedback::Destination::Bin1))
+                std::uint32_t const index = base + lane;
+                bool const active = index < count;
+                Particle const particle = active ? input.read(index) : Particle{};
+                auto const result = active ? apply(seed, particle) : particle_feedback::ApplyResult{};
+                bool const toBin1 = active && result.destination == particle_feedback::Destination::Bin1;
+                auto const mask0 = warp.ballot(active && !toBin1);
+                auto const mask1 = warp.ballot(toBin1);
+                std::uint32_t const rank0 = base0 + warp.rank(mask0);
+                std::uint32_t const rank1 = base1 + warp.rank(mask1);
+                if(active && toBin1)
                 {
-                    ++count1;
+                    if(rank1 >= bin1.size())
+                        errors |= particle_feedback::errorOutputOverflow;
+                    else
+                        bin1.write(rank1, particle);
                 }
-                else
+                else if(active)
                 {
-                    ++count0;
+                    if(rank0 >= bin0.size())
+                        errors |= particle_feedback::errorOutputOverflow;
+                    else
+                        bin0.write(rank0, particle);
                 }
-                ok = ok && !result.error;
+                if(active && result.error)
+                    errors |= particle_feedback::errorWeightOverflow;
+                base0 += WarpGroup<T_Acc>::popcount(mask0);
+                base1 += WarpGroup<T_Acc>::popcount(mask1);
             }
-            AppendRequest requests[2u]{};
-            requests[0u] = AppendRequest{particle_feedback::streamBin0(), 0u};
-            requests[1u] = AppendRequest{particle_feedback::streamBin1(), 0u};
-            for(std::uint32_t src = 0u; src < width; ++src)
-            {
-                requests[0u].itemCount += warp.broadcast(count0, src);
-                requests[1u].itemCount += warp.broadcast(count1, src);
-            }
+            (void) accessor.setOutputCount(bin0Port, base0);
+            if(bin1Port != bin0Port)
+                (void) accessor.setOutputCount(bin1Port, base1);
+            particle_feedback::publishError(acc, control, errors, warp.isLeader());
+        }
 
-            StreamReservation<Particle> reservation{};
-            auto const status = reservation.tryReserve(
-                acc,
-                warp,
-                warp.broadcast(static_cast<std::uint32_t>(count) + 1u),
-                assembler,
-                requests,
-                2u,
-                nullptr,
-                0u,
-                nullptr,
-                0u);
-            ok = ok && status == AppendStatus::Ok;
-            if(ok)
-            {
-                // Pass 2: write each element through its destination's rank.
-                for(std::size_t i = lane; i < count; ++i)
-                {
-                    auto const particle = input.read(i);
-                    auto const result = apply(seed, particle);
-                    auto const isBin1 = static_cast<std::uint32_t>(result.destination)
-                                        == static_cast<std::uint32_t>(particle_feedback::Destination::Bin1);
-                    auto const destination
-                        = isBin1 ? particle_feedback::streamBin1() : particle_feedback::streamBin0();
-                    auto const group = assembler.destinationGroup(warp, destination, true);
-                    auto const target = reservation.writePointer(isBin1 ? 1u : 0u, group.rank);
-                    if(target == nullptr)
-                    {
-                        ok = false;
-                        break;
-                    }
-                    *target = particle;
-                }
-                ok = ok && reservation.commit(acc, warp);
-                if(ok)
-                    reservation.retireInput(warp);
-                else
-                    reservation.cancel(acc, warp);
-            }
-            if(!ok && error != nullptr && warp.isLeader())
-                *error = true;
+        /** Static `OperationFn` entry point: the pool registers a plain
+         *  function pointer, not a pointer to a member template. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC static void operation(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+        {
+            FilterByProperty{}(acc, job, accessor);
         }
     };
 
@@ -369,89 +335,67 @@ namespace graph
         }
 
         template<typename T_Acc>
-        ALPAKA_FN_ACC void operator()(
-            T_Acc const& acc,
-            JobDescriptor const& job,
-            PacketAccessor const& accessor,
-            StreamAssembler<Particle> const& assembler,
-            bool* error) const noexcept
+        ALPAKA_FN_ACC void operator()(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+            const noexcept
         {
-            (void) acc;
             WarpGroup<T_Acc> warp{acc};
             auto const lane = warp.laneIndex();
             auto const width = warp.workerWidth();
             auto const seed = job.request.seed;
-
             auto const input = accessor.inputSpan<Particle const>(job.routing.inputPort);
-            auto const count = input.size();
+            std::uint32_t const count = static_cast<std::uint32_t>(input.size());
+            std::uint32_t const feedbackPort = job.routing.outputPort;
+            std::uint32_t const sinkPort
+                = job.routing.outputPortCount >= 2u ? job.routing.outputPort + 1u : job.routing.outputPort;
+            auto const feedback = accessor.outputSpan<Particle>(feedbackPort);
+            auto const sink = accessor.outputSpan<Particle>(sinkPort);
+            auto* control = particle_feedback::resultBlock(accessor);
 
-            std::uint32_t countFeedback = 0u;
-            std::uint32_t countSink = 0u;
-            bool ok = true;
-            for(std::size_t i = lane; i < count; ++i)
+            std::uint32_t baseFeedback = 0u;
+            std::uint32_t baseSink = 0u;
+            std::uint32_t errors = particle_feedback::errorNone;
+            for(std::uint32_t base = 0u; base < count; base += width)
             {
-                auto const result = apply(seed, input.read(i));
-                if(static_cast<std::uint32_t>(result.destination)
-                   == static_cast<std::uint32_t>(particle_feedback::Destination::FilterInput))
+                std::uint32_t const index = base + lane;
+                bool const active = index < count;
+                Particle const particle = active ? input.read(index) : Particle{};
+                auto const result = active ? apply(seed, particle) : particle_feedback::ApplyResult{};
+                bool const toFeedback = active && result.destination == particle_feedback::Destination::FilterInput;
+                auto const feedbackMask = warp.ballot(toFeedback);
+                auto const sinkMask = warp.ballot(active && !toFeedback);
+                std::uint32_t const feedbackRank = baseFeedback + warp.rank(feedbackMask);
+                std::uint32_t const sinkRank = baseSink + warp.rank(sinkMask);
+                if(toFeedback)
                 {
-                    ++countFeedback;
+                    if(feedbackRank >= feedback.size())
+                        errors |= particle_feedback::errorOutputOverflow;
+                    else
+                        feedback.write(feedbackRank, feedbackParticle(particle));
                 }
-                else
+                else if(active)
                 {
-                    ++countSink;
+                    if(sinkRank >= sink.size())
+                        errors |= particle_feedback::errorOutputOverflow;
+                    else
+                        sink.write(sinkRank, particle);
                 }
-                ok = ok && !result.error;
+                if(active && result.error)
+                    errors |= particle_feedback::errorWeightOverflow;
+                baseFeedback += WarpGroup<T_Acc>::popcount(feedbackMask);
+                baseSink += WarpGroup<T_Acc>::popcount(sinkMask);
             }
+            (void) accessor.setOutputCount(feedbackPort, baseFeedback);
+            if(sinkPort != feedbackPort)
+                (void) accessor.setOutputCount(sinkPort, baseSink);
+            particle_feedback::publishError(acc, control, errors, warp.isLeader());
+        }
 
-            AppendRequest requests[2u]{};
-            requests[0u] = AppendRequest{particle_feedback::streamFilterInput(), 0u};
-            requests[1u] = AppendRequest{particle_feedback::streamSink(), 0u};
-            for(std::uint32_t src = 0u; src < width; ++src)
-            {
-                requests[0u].itemCount += warp.broadcast(countFeedback, src);
-                requests[1u].itemCount += warp.broadcast(countSink, src);
-            }
-
-            StreamReservation<Particle> reservation{};
-            auto const status = reservation.tryReserve(
-                acc,
-                warp,
-                warp.broadcast(static_cast<std::uint32_t>(count) + 1u),
-                assembler,
-                requests,
-                2u,
-                nullptr,
-                0u,
-                nullptr,
-                0u);
-            ok = ok && status == AppendStatus::Ok;
-            if(ok)
-            {
-                for(std::size_t i = lane; i < count; ++i)
-                {
-                    auto const particle = input.read(i);
-                    auto const result = apply(seed, particle);
-                    auto const toFeedback = static_cast<std::uint32_t>(result.destination)
-                                            == static_cast<std::uint32_t>(particle_feedback::Destination::FilterInput);
-                    auto const destination
-                        = toFeedback ? particle_feedback::streamFilterInput() : particle_feedback::streamSink();
-                    auto const group = assembler.destinationGroup(warp, destination, true);
-                    auto const target = reservation.writePointer(toFeedback ? 0u : 1u, group.rank);
-                    if(target == nullptr)
-                    {
-                        ok = false;
-                        break;
-                    }
-                    *target = toFeedback ? feedbackParticle(particle) : particle;
-                }
-                ok = ok && reservation.commit(acc, warp);
-                if(ok)
-                    reservation.retireInput(warp);
-                else
-                    reservation.cancel(acc, warp);
-            }
-            if(!ok && error != nullptr && warp.isLeader())
-                *error = true;
+        /** Static `OperationFn` entry point: the pool registers a plain
+         *  function pointer, not a pointer to a member template. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC static void operation(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+        {
+            ProcessA{}(acc, job, accessor);
         }
     };
 
@@ -490,89 +434,67 @@ namespace graph
         }
 
         template<typename T_Acc>
-        ALPAKA_FN_ACC void operator()(
-            T_Acc const& acc,
-            JobDescriptor const& job,
-            PacketAccessor const& accessor,
-            StreamAssembler<Particle> const& assembler,
-            bool* error) const noexcept
+        ALPAKA_FN_ACC void operator()(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+            const noexcept
         {
-            (void) acc;
             WarpGroup<T_Acc> warp{acc};
             auto const lane = warp.laneIndex();
             auto const width = warp.workerWidth();
             auto const seed = job.request.seed;
-
             auto const input = accessor.inputSpan<Particle const>(job.routing.inputPort);
-            auto const count = input.size();
+            std::uint32_t const count = static_cast<std::uint32_t>(input.size());
+            std::uint32_t const feedbackPort = job.routing.outputPort;
+            std::uint32_t const sinkPort
+                = job.routing.outputPortCount >= 2u ? job.routing.outputPort + 1u : job.routing.outputPort;
+            auto const feedback = accessor.outputSpan<Particle>(feedbackPort);
+            auto const sink = accessor.outputSpan<Particle>(sinkPort);
+            auto* control = particle_feedback::resultBlock(accessor);
 
-            std::uint32_t countFeedback = 0u;
-            std::uint32_t countSink = 0u;
-            bool ok = true;
-            for(std::size_t i = lane; i < count; ++i)
+            std::uint32_t baseFeedback = 0u;
+            std::uint32_t baseSink = 0u;
+            std::uint32_t errors = particle_feedback::errorNone;
+            for(std::uint32_t base = 0u; base < count; base += width)
             {
-                auto const result = apply(seed, input.read(i));
-                if(static_cast<std::uint32_t>(result.destination)
-                   == static_cast<std::uint32_t>(particle_feedback::Destination::FilterInput))
+                std::uint32_t const index = base + lane;
+                bool const active = index < count;
+                Particle const particle = active ? input.read(index) : Particle{};
+                auto const result = active ? apply(seed, particle) : particle_feedback::ApplyResult{};
+                bool const toFeedback = active && result.destination == particle_feedback::Destination::FilterInput;
+                auto const feedbackMask = warp.ballot(toFeedback);
+                auto const sinkMask = warp.ballot(active && !toFeedback);
+                std::uint32_t const feedbackRank = baseFeedback + warp.rank(feedbackMask);
+                std::uint32_t const sinkRank = baseSink + warp.rank(sinkMask);
+                if(toFeedback)
                 {
-                    ++countFeedback;
+                    if(feedbackRank >= feedback.size())
+                        errors |= particle_feedback::errorOutputOverflow;
+                    else
+                        feedback.write(feedbackRank, feedbackParticle(particle));
                 }
-                else
+                else if(active)
                 {
-                    ++countSink;
+                    if(sinkRank >= sink.size())
+                        errors |= particle_feedback::errorOutputOverflow;
+                    else
+                        sink.write(sinkRank, particle);
                 }
-                ok = ok && !result.error;
+                if(active && result.error)
+                    errors |= particle_feedback::errorWeightOverflow;
+                baseFeedback += WarpGroup<T_Acc>::popcount(feedbackMask);
+                baseSink += WarpGroup<T_Acc>::popcount(sinkMask);
             }
+            (void) accessor.setOutputCount(feedbackPort, baseFeedback);
+            if(sinkPort != feedbackPort)
+                (void) accessor.setOutputCount(sinkPort, baseSink);
+            particle_feedback::publishError(acc, control, errors, warp.isLeader());
+        }
 
-            AppendRequest requests[2u]{};
-            requests[0u] = AppendRequest{particle_feedback::streamFilterInput(), 0u};
-            requests[1u] = AppendRequest{particle_feedback::streamSink(), 0u};
-            for(std::uint32_t src = 0u; src < width; ++src)
-            {
-                requests[0u].itemCount += warp.broadcast(countFeedback, src);
-                requests[1u].itemCount += warp.broadcast(countSink, src);
-            }
-
-            StreamReservation<Particle> reservation{};
-            auto const status = reservation.tryReserve(
-                acc,
-                warp,
-                warp.broadcast(static_cast<std::uint32_t>(count) + 1u),
-                assembler,
-                requests,
-                2u,
-                nullptr,
-                0u,
-                nullptr,
-                0u);
-            ok = ok && status == AppendStatus::Ok;
-            if(ok)
-            {
-                for(std::size_t i = lane; i < count; ++i)
-                {
-                    auto const particle = input.read(i);
-                    auto const result = apply(seed, particle);
-                    auto const toFeedback = static_cast<std::uint32_t>(result.destination)
-                                            == static_cast<std::uint32_t>(particle_feedback::Destination::FilterInput);
-                    auto const destination
-                        = toFeedback ? particle_feedback::streamFilterInput() : particle_feedback::streamSink();
-                    auto const group = assembler.destinationGroup(warp, destination, true);
-                    auto const target = reservation.writePointer(toFeedback ? 0u : 1u, group.rank);
-                    if(target == nullptr)
-                    {
-                        ok = false;
-                        break;
-                    }
-                    *target = toFeedback ? feedbackParticle(particle) : particle;
-                }
-                ok = ok && reservation.commit(acc, warp);
-                if(ok)
-                    reservation.retireInput(warp);
-                else
-                    reservation.cancel(acc, warp);
-            }
-            if(!ok && error != nullptr && warp.isLeader())
-                *error = true;
+        /** Static `OperationFn` entry point: the pool registers a plain
+         *  function pointer, not a pointer to a member template. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC static void operation(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+        {
+            ProcessB{}(acc, job, accessor);
         }
     };
 
@@ -596,44 +518,46 @@ namespace graph
         }
 
         template<typename T_Acc>
-        ALPAKA_FN_ACC void operator()(
-            T_Acc const& acc,
-            JobDescriptor const& job,
-            PacketAccessor const& accessor,
-            StreamAssembler<Particle> const& assembler,
-            bool* error) const noexcept
+        ALPAKA_FN_ACC void operator()(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+            const noexcept
         {
-            (void) acc;
-            (void) assembler;
             WarpGroup<T_Acc> warp{acc};
             auto const lane = warp.laneIndex();
             auto const width = warp.workerWidth();
-
             auto const input = accessor.inputSpan<Particle const>(job.routing.inputPort);
-            auto const count = input.size();
-            auto const slots = accessor.outputSpan<std::int64_t>(job.routing.outputPort);
-            auto const slotCount = slots.size();
-
-            bool ok = true;
-            for(std::size_t i = lane; i < count; ++i)
+            std::uint32_t const count = static_cast<std::uint32_t>(input.size());
+            auto* control = particle_feedback::resultBlock(accessor);
+            std::uint32_t const slots
+                = control != nullptr ? std::min(control->slotCount, control->sinkWriteCount) : 0u;
+            std::uint32_t errors = particle_feedback::errorNone;
+            for(std::uint32_t i = lane; i < count; i += width)
             {
-                auto const particle = input.read(i);
-                auto const slotIndex = particle.id - job.request.firstId;
-                if(slotIndex < slotCount)
+                Particle const particle = input.read(i);
+                if(control == nullptr || control->weights == nullptr || control->sinkWrites == nullptr
+                   || particle.id >= static_cast<std::uint64_t>(slots))
                 {
-                    slots.write(slotIndex, static_cast<std::int64_t>(particle.weight));
+                    errors |= particle_feedback::errorIdOutOfRange;
+                    continue;
                 }
-                else
-                {
-                    ok = false;
-                }
+                auto const slot = static_cast<std::uint32_t>(particle.id);
+                std::uint32_t const previous = alpaka::onAcc::atomicAdd(
+                    acc,
+                    &control->sinkWrites[slot],
+                    std::uint32_t{1},
+                    alpaka::onAcc::scope::device);
+                if(previous != 0u)
+                    errors |= particle_feedback::errorDuplicateSink;
+                control->weights[slot] = static_cast<std::int64_t>(particle.weight);
             }
-            // The sink has no output stream, so there is nothing to commit. The
-            // input packet is retired exactly once by the caller's scheduler
-            // record, as guaranteed by the one-write-per-slot invariant above.
-            (void) warp.isLeader();
-            if(!ok && error != nullptr && warp.isLeader())
-                *error = true;
+            particle_feedback::publishError(acc, control, errors, warp.isLeader());
+        }
+
+        /** Static `OperationFn` entry point: the pool registers a plain
+         *  function pointer, not a pointer to a member template. */
+        template<typename T_Acc>
+        ALPAKA_FN_ACC static void operation(T_Acc const& acc, JobDescriptor const& job, PacketAccessor const& accessor)
+        {
+            DestroyParticles{}(acc, job, accessor);
         }
     };
 } // namespace graph

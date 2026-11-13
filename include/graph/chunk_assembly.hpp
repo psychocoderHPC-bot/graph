@@ -135,6 +135,20 @@ namespace graph
         T* storage{nullptr};
         std::uint32_t slotCount{0u};
         std::uint32_t elementCapacity{0u};
+        /**
+         * Distance between two slots in elements.
+         *
+         * The pool-backed arena reuses packet-pool slots whose payload stride
+         * is larger than the logical chunk capacity. Zero keeps the historic
+         * packed layout (`stride == elementCapacity`); the scheduler sets an
+         * explicit stride when it overlays the arena on the packet pool.
+         */
+        std::uint32_t elementStride{0u};
+
+        ALPAKA_FN_HOST_ACC constexpr std::uint32_t stride() const noexcept
+        {
+            return elementStride != 0u ? elementStride : elementCapacity;
+        }
 
         /** True when `chunk` names a slot of this arena with the arena's capacity. */
         ALPAKA_FN_HOST_ACC constexpr bool contains(ChunkSlot<T> const& chunk) const noexcept
@@ -146,7 +160,7 @@ namespace graph
         /** Element pointer of the first element of `chunk`. */
         ALPAKA_FN_HOST_ACC constexpr T* data(ChunkSlot<T> const& chunk) const noexcept
         {
-            return storage + static_cast<std::size_t>(chunk.slot) * static_cast<std::size_t>(elementCapacity);
+            return storage + static_cast<std::size_t>(chunk.slot) * static_cast<std::size_t>(stride());
         }
     };
 
@@ -170,6 +184,15 @@ namespace graph
         std::uint32_t version{0u};
         /** Set when a terminal partial flush detached the last chunk. */
         bool drained{false};
+        /**
+         * Request seed of the last append.
+         *
+         * A drain-published partial chunk has no parent job to inherit a
+         * request from, so the scheduler remembers the stream's deterministic
+         * key here. Single-seed runs use it unchanged; a multi-seed producer
+         * would need per-element state instead.
+         */
+        std::uint64_t seed{0u};
     };
 
     static_assert(std::is_trivially_copyable_v<AssemblyStream<float>>);
@@ -335,6 +358,7 @@ namespace graph
                     state.claim = 0u;
                     state.version = 1u;
                     state.drained = false;
+                    state.seed = 0u;
                     ok = true;
                 }
             }

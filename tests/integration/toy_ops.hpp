@@ -142,6 +142,13 @@ namespace graph::toy
         std::uint32_t resultCount{0u};
         std::uint32_t* sinkWrites{nullptr};
         std::uint32_t sinkWriteCount{0u};
+        /** Feedback rounds applied by `ToyRevisit`; zero sends everything to
+         *  the sink on the first visit. */
+        std::uint32_t revisitCount{0u};
+        /** Published chunk sizes observed at the sink, in arrival order. */
+        std::uint32_t chunkSizes[64]{};
+        std::uint32_t chunkSizeCount{0u};
+        std::uint32_t chunkSizeCapacity{64u};
     };
 
     static_assert(std::is_trivially_copyable_v<ToyInstrumentation>);
@@ -588,6 +595,7 @@ namespace graph::toy
                     localErrors |= toyErrorIdOutOfRange;
                 output.write(i, toyMakeItem(id, job.request.seed));
             }
+            (void) accessor.setOutputCount(job.routing.outputPort, emitted);
             toyPublishErrors(acc, control, localErrors | plan.errorFlags);
             toyRecordInvocation(acc, control, ToyOpSlot::Source, emitted);
         }
@@ -616,6 +624,7 @@ namespace graph::toy
                     localErrors |= toyErrorIdOutOfRange;
                 output.write(i, item);
             }
+            (void) accessor.setOutputCount(toyPassThroughPort(job.routing), count);
             toyPublishErrors(acc, control, localErrors);
             toyRecordInvocation(acc, control, ToyOpSlot::PassThrough, count);
         }
@@ -671,6 +680,9 @@ namespace graph::toy
                 base0 += WarpGroup<T_Acc>::popcount(mask0);
                 base1 += WarpGroup<T_Acc>::popcount(mask1);
             }
+            (void) accessor.setOutputCount(job.routing.outputPort, base0);
+            if(hasBin1)
+                (void) accessor.setOutputCount(bin1Port, base1);
             toyPublishErrors(acc, control, localErrors);
             toyRecordInvocation(acc, control, ToyOpSlot::Split, count);
         }
@@ -689,7 +701,10 @@ namespace graph::toy
             std::uint32_t const sinkPort = hasFeedback ? job.routing.outputPort + 1u : job.routing.outputPort;
             auto const feedback = accessor.outputSpan<ToyItem>(feedbackPort);
             auto const sink = accessor.outputSpan<ToyItem>(sinkPort);
-            auto const revisitCount = static_cast<std::uint32_t>(job.request.count);
+            std::uint32_t const configureCount
+                = control != nullptr ? control->revisitCount : static_cast<std::uint32_t>(job.request.count);
+            // Without a distinct feedback port every item must go to the sink.
+            std::uint32_t const revisitCount = hasFeedback ? configureCount : 0u;
             std::uint32_t const count = static_cast<std::uint32_t>(input.size());
             std::uint32_t const idLimit = control != nullptr ? control->idLimit : 0u;
 
@@ -731,6 +746,15 @@ namespace graph::toy
                 baseFeedback += WarpGroup<T_Acc>::popcount(feedbackMask);
                 baseSink += WarpGroup<T_Acc>::popcount(sinkMask);
             }
+            if(hasFeedback)
+            {
+                (void) accessor.setOutputCount(feedbackPort, baseFeedback);
+                (void) accessor.setOutputCount(sinkPort, baseSink);
+            }
+            else
+            {
+                (void) accessor.setOutputCount(feedbackPort, baseSink);
+            }
             toyPublishErrors(acc, control, localErrors);
             toyRecordInvocation(acc, control, ToyOpSlot::Revisit, count);
         }
@@ -768,6 +792,16 @@ namespace graph::toy
                 if(previous != 0u)
                     localErrors |= toyErrorDuplicateSink;
                 control->results[slot] = ToyResult{item.value, item.visit, previous + 1u, 0u};
+            }
+            if(control != nullptr && warp.isLeader())
+            {
+                std::uint32_t const slot = alpaka::onAcc::atomicAdd(
+                    acc,
+                    &control->chunkSizeCount,
+                    std::uint32_t{1},
+                    alpaka::onAcc::scope::device);
+                if(slot < control->chunkSizeCapacity)
+                    control->chunkSizes[slot] = count;
             }
             toyPublishErrors(acc, control, localErrors);
             toyRecordInvocation(acc, control, ToyOpSlot::Sink, count);
@@ -892,9 +926,17 @@ namespace graph::toy
         revisit.operation = config.operations.revisit;
         revisit.inputs.push_back(InputPortDescriptor{schema});
         revisit.inputs.push_back(InputPortDescriptor{schema});
-        revisit.outputs.push_back(OutputPortDescriptor{schema, config.streams.sink, port});
+        // Port 0 is the feedback port and port 1 is the sink, matching the
+        // `ToyRevisit` ABI convention (feedback first, sink second).
         if(config.feedback)
+        {
             revisit.outputs.push_back(OutputPortDescriptor{schema, config.streams.feedback, port});
+            revisit.outputs.push_back(OutputPortDescriptor{schema, config.streams.sink, port});
+        }
+        else
+        {
+            revisit.outputs.push_back(OutputPortDescriptor{schema, config.streams.sink, port});
+        }
 
         NodeDescriptor sink;
         sink.name = "ToySink";
@@ -909,10 +951,14 @@ namespace graph::toy
         model.addEdge(EdgeDescriptor{sourceNode, 0u, splitNode, 0u, config.streams.splitInput, port, false});
         model.addEdge(EdgeDescriptor{splitNode, 0u, revisitNode, 0u, config.streams.bin0, port, false});
         model.addEdge(EdgeDescriptor{splitNode, 1u, revisitNode, 1u, config.streams.bin1, port, false});
-        model.addEdge(EdgeDescriptor{revisitNode, 0u, sinkNode, 0u, config.streams.sink, port, false});
         if(config.feedback)
         {
-            model.addEdge(EdgeDescriptor{revisitNode, 1u, splitNode, 1u, config.streams.feedback, port, true});
+            model.addEdge(EdgeDescriptor{revisitNode, 0u, splitNode, 1u, config.streams.feedback, port, true});
+            model.addEdge(EdgeDescriptor{revisitNode, 1u, sinkNode, 0u, config.streams.sink, port, false});
+        }
+        else
+        {
+            model.addEdge(EdgeDescriptor{revisitNode, 0u, sinkNode, 0u, config.streams.sink, port, false});
         }
 
         return model;
