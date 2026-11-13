@@ -20,6 +20,37 @@ namespace
 {
     using Value = std::uint64_t;
 
+#if GRAPH_HAS_CUDA
+    /** Compile-time contract for the portable system-atomic alignment rule.
+     *
+     * `checkSupported<T>()` is the gate every production primitive calls. It
+     * must accept both payload widths the graph uses and derive the natural
+     * alignment for the type's size, with or without libcu++'s
+     * `required_alignment` member.
+     */
+    template<typename T>
+    constexpr bool systemAtomicAlignmentSatisfied()
+    {
+        graph::detail::cuda::detail::checkSupported<T>();
+        return alignof(T) >= graph::detail::cuda::detail::systemAtomicRequiredAlignment<T>();
+    }
+
+    static_assert(systemAtomicAlignmentSatisfied<std::uint32_t>());
+    static_assert(systemAtomicAlignmentSatisfied<std::uint64_t>());
+    static_assert(graph::detail::cuda::detail::systemAtomicRequiredAlignment<std::uint32_t>() == 4u);
+    static_assert(graph::detail::cuda::detail::systemAtomicRequiredAlignment<std::uint64_t>() == 8u);
+
+    // Rejected-type example (kept commented out so this file compiles): an
+    // 8-byte payload with only 4 bytes of alignment cannot satisfy the
+    // 8-byte system-atomic requirement.
+    //
+    //   struct alignas(4) Misaligned64
+    //   {
+    //       unsigned char bytes[8];
+    //   };
+    //   static_assert(alignof(Misaligned64) >= sizeof(Misaligned64)); // fails: 4 < 8
+#endif
+
     /** Mixing function shared by the producer and consumer so a reordered or
      *  duplicated slot is detected by the payload check, not only by the
      *  sequence number.

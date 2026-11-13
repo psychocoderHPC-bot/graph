@@ -8,6 +8,7 @@
 #include <graph/detail/config.hpp>
 
 #include <concepts>
+#include <cstddef>
 #include <type_traits>
 
 #if GRAPH_HAS_CUDA
@@ -37,6 +38,36 @@ namespace graph::detail::cuda
 #if GRAPH_HAS_CUDA
     namespace detail
     {
+        /** Alignment a libcu++ system-scope atomic needs for @p T.
+         *
+         * A system-scope atomic on an integer type of size N needs N-byte
+         * (natural) alignment. libcu++ exposes this as
+         * `atomic_ref<T, thread_scope_system>::required_alignment`, which it
+         * defines as `sizeof(T)` from CUDA 13 on. CUDA 12.5's libcu++ has no
+         * such member, so probe it and fall back to the same value. The fallback
+         * names the contract it relies on: 4- and 8-byte unsigned payloads,
+         * whose natural alignment equals their size on the supported 64-bit
+         * ABIs. The fallback returns the same `sizeof(T)` value, so the
+         * enforced rule is `alignof(T) >= sizeof(T)` for `uint32_t` and
+         * `uint64_t`.
+         */
+        template<typename T>
+        constexpr std::size_t systemAtomicRequiredAlignment()
+        {
+            if constexpr(requires { ::cuda::atomic_ref<T, ::cuda::thread_scope_system>::required_alignment; })
+            {
+                return ::cuda::atomic_ref<T, ::cuda::thread_scope_system>::required_alignment;
+            }
+            else
+            {
+                static_assert(
+                    std::is_unsigned_v<T> && (sizeof(T) == 4u || sizeof(T) == 8u),
+                    "graph: the portable system-atomic alignment contract covers 4- and 8-byte unsigned integer "
+                    "payloads only");
+                return sizeof(T);
+            }
+        }
+
         template<typename T>
         constexpr void checkSupported()
         {
@@ -45,7 +76,7 @@ namespace graph::detail::cuda
                 ::cuda::atomic_ref<T, ::cuda::thread_scope_system>::is_always_lock_free,
                 "graph: the CUDA system-scope atomic_ref is not lock-free for this type");
             static_assert(
-                alignof(T) >= ::cuda::atomic_ref<T, ::cuda::thread_scope_system>::required_alignment,
+                alignof(T) >= systemAtomicRequiredAlignment<T>(),
                 "graph: the element alignment is lower than the system atomic requires; over-align the allocation");
         }
 
