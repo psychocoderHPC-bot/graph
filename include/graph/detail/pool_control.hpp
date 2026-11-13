@@ -91,7 +91,17 @@ namespace graph
          * out-of-range worker index and stops with the same bit. It is never
          * accepted and then indexed out of range.
          */
-        workerCapacityExceeded = 1u << 10u
+        workerCapacityExceeded = 1u << 10u,
+        /**
+         * A published packet's logical element count exceeded its capacity or
+         * diverged from the committed plan.
+         *
+         * A consumer must never observe more elements than the producer wrote.
+         * The pool records this bit at publication when the check fails, so a
+         * count/length regression is a named, aborting failure instead of a
+         * silent over-read.
+         */
+        packetExceedsCapacity = 1u << 11u
     };
 
     ALPAKA_FN_HOST_ACC constexpr std::uint32_t poolErrorBits(PoolError error) noexcept
@@ -290,6 +300,14 @@ namespace graph
         std::uint32_t workerCount{0u};
         /** Blocks that took the initializer branch. Must be exactly one. */
         std::uint64_t initializerClaims{0u};
+        /** Peak number of packet slots held at once (recycling diagnostic). */
+        std::uint64_t peakHeldSlots{0u};
+        /** Packet slots returned to the pool (a long run must recycle). */
+        std::uint64_t slotsReturned{0u};
+        /** Non-empty partial buffers released by the drain protocol. */
+        std::uint64_t drainPublications{0u};
+        /** Quiescence/drain rounds executed. */
+        std::uint64_t drainRounds{0u};
     };
 
     /** Result of one whole pool lifetime. */
@@ -381,6 +399,14 @@ namespace graph
             alignas(128) std::uint32_t debugConfigured{0u};
             alignas(128) std::uint32_t debugStopStage{0u};
             alignas(128) std::uint64_t workerBits[poolMaxWorkers / 64u]{};
+            /** Peak number of packet slots held at once (diagnostic). */
+            alignas(128) std::uint64_t peakHeldSlots{0u};
+            /** Number of packet slots returned to the pool during the run. */
+            alignas(128) std::uint64_t slotsReturned{0u};
+            /** Number of non-empty partial buffers released during a drain. */
+            alignas(128) std::uint64_t drainPublications{0u};
+            /** Quiescence/drain rounds executed (repeat-detection count). */
+            alignas(128) std::uint64_t drainRounds{0u};
         };
 
         static_assert(std::is_trivially_copyable_v<PoolDeviceState>);

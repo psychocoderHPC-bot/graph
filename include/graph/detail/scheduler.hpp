@@ -5,6 +5,7 @@
 
 #include <alpaka/alpaka.hpp>
 
+#include <graph/chunk_assembly.hpp>
 #include <graph/detail/job.hpp>
 #include <graph/detail/operation.hpp>
 #include <graph/detail/packet.hpp>
@@ -104,6 +105,14 @@ namespace graph
             ElementSchema packetSchema{};
             PacketPoolBudget budget{};
             void* controlBlock{nullptr};
+            // Real per-destination chunk assembly (design section 6). The
+            // assembler state (stream table + chunk arena) is preallocated by the
+            // host, copied to device storage, and owned by the pool for its
+            // lifetime. A job that assembles chunks routes its outputs through
+            // the reservation/commit protocol against this state.
+            void* assemblyStorage{nullptr};
+            std::uint32_t assemblyStreamCount{0u};
+            std::uint32_t assemblySlotCount{0u};
         };
 
         static_assert(std::is_trivially_copyable_v<PoolKernelArgs>);
@@ -852,10 +861,22 @@ namespace graph
             return ok;
         }
 
-        /** Execute one claimed job with every lane of the warp. */
+        /** Execute one claimed job with every lane of the warp.
+         *
+         * The operation's functor writes its output elements to the output
+         * packet spans the accessor resolves (the functors keep writing to their
+         * output ports). For a node that assembles chunks, the scheduler owns
+         * the per-destination chunk state and, after the functor returns,
+         * copies the produced elements into the stream's reserved range,
+         * commits the counter, rotates the chunk pair, and publishes the filled
+         * chunk downstream as a real packet with its true element count
+         * (design section 6). Count publication and A/B slot rotation live in
+         * the scheduler; the per-particle transformation stays in the functor.
+         */
         template<typename T_Acc>
         ALPAKA_FN_ACC inline bool executeJob(SchedulerRuntime<T_Acc>& runtime, JobDescriptor const& job) noexcept
         {
+            using Acc = typename SchedulerRuntime<T_Acc>::Acc;
             CompiledNode const* node = findNode(runtime.graph, job.operation);
             bool const isSource = node != nullptr && node->isSource;
             // A non-source job names the packet it reads. Reject a handle whose
@@ -876,13 +897,17 @@ namespace graph
             // Reserved control port: never a stream, never part of routing.
             accessor.inputData[maxPacketPorts - 1u] = runtime.args.controlBlock;
 
-            OperationFn<typename SchedulerRuntime<T_Acc>::Acc> const function = runtime.table.resolve(job.operation);
+            OperationFn<Acc> const function = runtime.table.resolve(job.operation);
             if(function == nullptr)
             {
                 if(runtime.warp.isLeader())
                     recordError(runtime, PoolError::unknownOperation);
                 return false;
             }
+
+            // The functor writes its outputs to the spans the accessor resolves.
+            // The count and the A/B slot rotation are the scheduler's job for an
+            // assembly node; a source or sink writes its slot(s) directly.
             function(runtime.acc, job, accessor);
             if(runtime.warp.isLeader() && job.operation.value < 8u)
                 (void) addDevice(runtime.acc, &runtime.state.execCounts[job.operation.value], std::uint64_t{1u});
